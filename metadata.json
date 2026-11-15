@@ -1,0 +1,8 @@
+{
+  "name": "DraftPlan CAD",
+  "description": "Lightweight 2D mechanical drawing PDF analyzer, interactive CAD vector plotter, and CNC manufacturing process planner.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
