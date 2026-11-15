@@ -16,6 +16,8 @@ import type {
 import { getDefaultOperationTemplate } from './camEngine';
 
 export const PT_TO_MM = 25.4 / 72;
+export const MAX_TOTAL_VECTOR_SEGMENTS = 20000;
+export const MAX_CHUNK_VECTOR_SEGMENTS = 8000;
 
 type Matrix = [number, number, number, number, number, number];
 
@@ -41,6 +43,8 @@ interface InternalSegment {
   isDashed: boolean;
   dashCount: number;
   pathSegCount: number;
+  subpathId: number;
+  isFilled: boolean;
 }
 
 export interface PdfOpsTable {
@@ -59,6 +63,10 @@ export interface PdfOpsTable {
   curveTo3: number;
   closePath: number;
   rectangle: number;
+  fill?: number;
+  eoFill?: number;
+  fillStroke?: number;
+  eoFillStroke?: number;
 }
 
 export interface PdfViewportLike {
@@ -116,29 +124,38 @@ function parseStrokeLuminance(args: unknown[]): number | null {
   return null;
 }
 
+interface SheetBox {
+  x1: number;
+  y1: number;
+  x2: number;
+  y2: number;
+}
+
+const TITLE_BLOCK_KEYWORDS = [
+  'DRAWN',
+  "CHK'D",
+  "APPV'D",
+  'MATERIAL',
+  'MAT:',
+  'DWG NO',
+  'PART NO',
+  'SCALE:',
+  'SCALE ',
+  'SHEET 1',
+  'DO NOT SCALE',
+  'UNLESS OTHERWISE',
+  'DIMENSIONS ARE IN',
+];
+
 // shortcut: assumes landscape/standard bottom title block (>=70% down sheet); upgrade if top/side title blocks are needed
 export function detectTitleBlockTopNy(
   segments: Array<{ nx1: number; ny1: number; nx2: number; ny2: number }>,
   textItems: RawNormalizedText[]
 ): number {
-  const titleKeywords = [
-    'DRAWN',
-    "CHK'D",
-    "APPV'D",
-    'MATERIAL',
-    'DWG NO',
-    'SCALE:',
-    'SCALE ',
-    'SHEET 1',
-    'DO NOT SCALE',
-    'UNLESS OTHERWISE',
-    'DIMENSIONS ARE IN',
-  ];
-
   const anchorYs = textItems
     .filter((t) => {
       const u = t.text.toUpperCase();
-      return t.ny > 0.7 && titleKeywords.some((kw) => u.includes(kw));
+      return t.ny > 0.7 && TITLE_BLOCK_KEYWORDS.some((kw) => u.includes(kw));
     })
     .map((t) => t.ny);
 
@@ -160,8 +177,207 @@ export function detectTitleBlockTopNy(
   return Math.max(0.72, Math.min(0.84, minAnchorY - 0.018));
 }
 
-// shortcut: tuned for SolidWorks/ISO A-series sheet margins & gray zone ticks; upgrade if dark parts extend into outer 5% border
-function isSheetChromeSegment(seg: InternalSegment, titleBlockTopNy: number): boolean {
+function collectSubpathRects(segments: InternalSegment[]): SheetBox[] {
+  const bySubpath = new Map<number, InternalSegment[]>();
+  for (const seg of segments) {
+    if (!seg.subpathId) continue;
+    const arr = bySubpath.get(seg.subpathId);
+    if (arr) arr.push(seg);
+    else bySubpath.set(seg.subpathId, [seg]);
+  }
+
+  const rects: SheetBox[] = [];
+  for (const segs of bySubpath.values()) {
+    if (segs.length !== 4) continue;
+    let x1 = Infinity;
+    let y1 = Infinity;
+    let x2 = -Infinity;
+    let y2 = -Infinity;
+    let hCount = 0;
+    let vCount = 0;
+    for (const s of segs) {
+      const dx = Math.abs(s.nx2 - s.nx1);
+      const dy = Math.abs(s.ny2 - s.ny1);
+      if (dy <= 0.006 && dx >= 0.02) hCount++;
+      else if (dx <= 0.006 && dy >= 0.02) vCount++;
+      x1 = Math.min(x1, s.nx1, s.nx2);
+      y1 = Math.min(y1, s.ny1, s.ny2);
+      x2 = Math.max(x2, s.nx1, s.nx2);
+      y2 = Math.max(y2, s.ny1, s.ny2);
+    }
+    if (hCount === 2 && vCount === 2 && Number.isFinite(x1)) {
+      rects.push({ x1, y1, x2, y2 });
+    }
+  }
+  return rects;
+}
+
+function detectSheetChromeContext(
+  segments: InternalSegment[],
+  textItems: RawNormalizedText[],
+  titleBlockTopNy: number
+): { borderRect: SheetBox | null; titleBlockRect: SheetBox | null } {
+  const subpathRects = collectSubpathRects(segments);
+  const borderCandidates: SheetBox[] = subpathRects.filter(
+    (r) =>
+      r.x2 - r.x1 >= 0.64 &&
+      r.y2 - r.y1 >= 0.64 &&
+      r.x1 <= 0.22 &&
+      r.x2 >= 0.78 &&
+      r.y1 <= 0.22 &&
+      r.y2 >= 0.78
+  );
+
+  // Also detect frames formed by 4 independent long near-axis-aligned border lines
+  const horiz = segments.filter(
+    (s) => Math.abs(s.nx2 - s.nx1) >= 0.58 && Math.abs(s.ny2 - s.ny1) <= 0.008
+  );
+  const vert = segments.filter(
+    (s) => Math.abs(s.ny2 - s.ny1) >= 0.58 && Math.abs(s.nx2 - s.nx1) <= 0.008
+  );
+
+  const tops = horiz.filter((s) => (s.ny1 + s.ny2) / 2 <= 0.22);
+  const bots = horiz.filter((s) => (s.ny1 + s.ny2) / 2 >= 0.78);
+  const lefts = vert.filter((s) => (s.nx1 + s.nx2) / 2 <= 0.22);
+  const rights = vert.filter((s) => (s.nx1 + s.nx2) / 2 >= 0.78);
+
+  const tol = 0.025;
+  for (const t of tops) {
+    const tx1 = Math.min(t.nx1, t.nx2);
+    const tx2 = Math.max(t.nx1, t.nx2);
+    const ty = (t.ny1 + t.ny2) / 2;
+    for (const b of bots) {
+      const bx1 = Math.min(b.nx1, b.nx2);
+      const bx2 = Math.max(b.nx1, b.nx2);
+      const by = (b.ny1 + b.ny2) / 2;
+      if (Math.abs(tx1 - bx1) > tol || Math.abs(tx2 - bx2) > tol || by - ty < 0.64) continue;
+      const hasLeft = lefts.some((l) => {
+        const lx = (l.nx1 + l.nx2) / 2;
+        const ly1 = Math.min(l.ny1, l.ny2);
+        const ly2 = Math.max(l.ny1, l.ny2);
+        return Math.abs(lx - tx1) <= tol && Math.abs(ly1 - ty) <= tol && Math.abs(ly2 - by) <= tol;
+      });
+      const hasRight = rights.some((r) => {
+        const rx = (r.nx1 + r.nx2) / 2;
+        const ry1 = Math.min(r.ny1, r.ny2);
+        const ry2 = Math.max(r.ny1, r.ny2);
+        return Math.abs(rx - tx2) <= tol && Math.abs(ry1 - ty) <= tol && Math.abs(ry2 - by) <= tol;
+      });
+      if (hasLeft && hasRight) {
+        borderCandidates.push({
+          x1: Math.min(tx1, bx1),
+          y1: ty,
+          x2: Math.max(tx2, bx2),
+          y2: by,
+        });
+      }
+    }
+  }
+
+  if (borderCandidates.length === 0) {
+    return { borderRect: null, titleBlockRect: null };
+  }
+
+  // Pick outermost frame, then step inward if an ISO/SolidWorks concentric inner border exists
+  let outerBorder = borderCandidates[0];
+  let outerArea = (outerBorder.x2 - outerBorder.x1) * (outerBorder.y2 - outerBorder.y1);
+  for (const c of borderCandidates) {
+    const area = (c.x2 - c.x1) * (c.y2 - c.y1);
+    if (area > outerArea) {
+      outerBorder = c;
+      outerArea = area;
+    }
+  }
+
+  let borderRect = outerBorder;
+  let innerArea = outerArea;
+  for (const c of borderCandidates) {
+    if (
+      c.x1 > outerBorder.x1 + 0.003 &&
+      c.x2 < outerBorder.x2 - 0.003 &&
+      c.y1 > outerBorder.y1 + 0.003 &&
+      c.y2 < outerBorder.y2 - 0.003 &&
+      c.x1 - outerBorder.x1 <= 0.075 &&
+      outerBorder.x2 - c.x2 <= 0.075 &&
+      c.y1 - outerBorder.y1 <= 0.075 &&
+      outerBorder.y2 - c.y2 <= 0.075
+    ) {
+      const area = (c.x2 - c.x1) * (c.y2 - c.y1);
+      if (area < innerArea) {
+        borderRect = c;
+        innerArea = area;
+      }
+    }
+  }
+
+  // Detect title-block rectangle (either closed `re` box in bottom region or wide divider strip)
+  const titleAnchorTexts = textItems.filter((t) => {
+    const u = t.text.toUpperCase();
+    return t.ny >= 0.62 && TITLE_BLOCK_KEYWORDS.some((kw) => u.includes(kw));
+  });
+
+  const tbRects = subpathRects.filter(
+    (r) =>
+      r.y1 >= 0.60 &&
+      r.y2 <= borderRect.y2 + 0.02 &&
+      r.y2 - r.y1 >= 0.05 &&
+      r.y2 - r.y1 <= 0.40 &&
+      r.x2 - r.x1 >= 0.18 &&
+      (r.x2 - r.x1 < borderRect.x2 - borderRect.x1 - 0.02 || r.y1 >= 0.70) &&
+      (titleAnchorTexts.length === 0 ||
+        titleAnchorTexts.some(
+          (t) => t.nx >= r.x1 - 0.02 && t.nx <= r.x2 + 0.02 && t.ny >= r.y1 - 0.02 && t.ny <= r.y2 + 0.02
+        ))
+  );
+
+  let titleBlockRect: SheetBox | null = null;
+  if (tbRects.length > 0) {
+    titleBlockRect = tbRects.reduce((acc, r) => ({
+      x1: Math.min(acc.x1, r.x1),
+      y1: Math.min(acc.y1, r.y1),
+      x2: Math.max(acc.x2, r.x2),
+      y2: Math.max(acc.y2, r.y2),
+    }));
+  } else {
+    const dividerLines = segments.filter((s) => {
+      const spanX = Math.abs(s.nx2 - s.nx1);
+      const spanY = Math.abs(s.ny2 - s.ny1);
+      const midY = (s.ny1 + s.ny2) / 2;
+      return spanX >= 0.40 && spanY <= 0.008 && midY >= 0.68 && midY <= borderRect.y2 - 0.03;
+    });
+    if (dividerLines.length > 0) {
+      let tbX1 = Infinity;
+      let tbY1 = Infinity;
+      let tbX2 = -Infinity;
+      for (const l of dividerLines) {
+        tbX1 = Math.min(tbX1, l.nx1, l.nx2);
+        tbX2 = Math.max(tbX2, l.nx1, l.nx2);
+        tbY1 = Math.min(tbY1, l.ny1, l.ny2);
+      }
+      titleBlockRect = {
+        x1: Math.max(borderRect.x1, tbX1),
+        y1: Math.max(0.68, tbY1 - 0.004),
+        x2: Math.min(borderRect.x2, tbX2),
+        y2: borderRect.y2,
+      };
+    } else if (titleAnchorTexts.length > 0 || titleBlockTopNy < borderRect.y2 - 0.02) {
+      titleBlockRect = {
+        x1: borderRect.x1,
+        y1: titleBlockTopNy,
+        x2: borderRect.x2,
+        y2: borderRect.y2,
+      };
+    }
+  }
+
+  return { borderRect, titleBlockRect };
+}
+
+function isSheetChromeSegment(
+  seg: InternalSegment,
+  titleBlockTopNy: number,
+  chromeCtx?: { borderRect: SheetBox | null; titleBlockRect: SheetBox | null }
+): boolean {
   const minNx = Math.min(seg.nx1, seg.nx2);
   const maxNx = Math.max(seg.nx1, seg.nx2);
   const minNy = Math.min(seg.ny1, seg.ny2);
@@ -169,6 +385,36 @@ function isSheetChromeSegment(seg: InternalSegment, titleBlockTopNy: number): bo
   const spanX = maxNx - minNx;
   const spanY = maxNy - minNy;
 
+  if (chromeCtx?.borderRect) {
+    const b = chromeCtx.borderRect;
+    const tb = chromeCtx.titleBlockRect;
+    const eps = 0.006;
+
+    // On or outside the detected drawing border (including concentric margin zone ticks)
+    if (
+      minNx <= b.x1 + eps ||
+      maxNx >= b.x2 - eps ||
+      minNy <= b.y1 + eps ||
+      maxNy >= b.y2 - eps
+    ) {
+      return true;
+    }
+
+    // Inside or bounding the title-block rectangle
+    if (
+      tb &&
+      minNx >= tb.x1 - eps &&
+      maxNx <= tb.x2 + eps &&
+      minNy >= tb.y1 - eps &&
+      maxNy <= tb.y2 + eps
+    ) {
+      return true;
+    }
+
+    return false;
+  }
+
+  // Fallback legacy heuristics when no sheet border rectangle is detected
   if (spanX > 0.68 || spanY > 0.68) return true;
   if (minNy > 0.955) return true;
   if (minNy >= titleBlockTopNy && maxNy > titleBlockTopNy + 0.01) return true;
@@ -280,6 +526,8 @@ export function parseOperatorListToSegments(
       isDashed: gState.dashPattern.length > 0,
       dashCount: gState.dashPattern.length,
       pathSegCount: 1,
+      subpathId: 0,
+      isFilled: false,
     });
   };
 
@@ -338,10 +586,15 @@ export function parseOperatorListToSegments(
     curY = ey;
   };
 
-  const commitPathSegments = (pathSegs: InternalSegment[]) => {
+  let nextSubpathId = 1;
+  const commitPathSegments = (pathSegs: InternalSegment[], isFilled = false) => {
+    if (pathSegs.length === 0) return;
+    const id = nextSubpathId++;
     const count = pathSegs.length;
     for (const s of pathSegs) {
       s.pathSegCount = count;
+      s.subpathId = id;
+      s.isFilled = isFilled;
       allInternalSegments.push(s);
     }
   };
@@ -420,7 +673,15 @@ export function parseOperatorListToSegments(
       const arr = Array.isArray(args[0]) ? (args[0] as number[]) : [];
       gState.dashPattern = arr.filter((n) => typeof n === 'number' && n > 0);
     } else if (fn === OPS.constructPath) {
-      const pathSegs: InternalSegment[] = [];
+      let pathSegs: InternalSegment[] = [];
+      const paintOp = typeof args[0] === 'number' ? args[0] : -1;
+      const isFilled =
+        paintOp !== -1 &&
+        (paintOp === OPS.fill ||
+          paintOp === OPS.eoFill ||
+          paintOp === OPS.fillStroke ||
+          paintOp === OPS.eoFillStroke);
+
       // pdfjs-dist v5+ packed DrawOPS format: args[0] = paintOp, args[1] = [Float32Array]
       if (
         typeof args[0] === 'number' &&
@@ -433,6 +694,10 @@ export function parseOperatorListToSegments(
         while (k < arr.length) {
           const sub = arr[k++];
           if (sub === 0) {
+            if (pathSegs.length > 0) {
+              commitPathSegments(pathSegs, isFilled);
+              pathSegs = [];
+            }
             curX = arr[k++];
             curY = arr[k++];
             startX = curX;
@@ -468,10 +733,14 @@ export function parseOperatorListToSegments(
         const coords = args[1] as number[];
         const idxRef = { idx: 0 };
         for (const subOp of subOps) {
+          if (subOp === OPS.moveTo && pathSegs.length > 0) {
+            commitPathSegments(pathSegs, isFilled);
+            pathSegs = [];
+          }
           handleLegacySubOp(subOp, coords, idxRef, pathSegs);
         }
       }
-      commitPathSegments(pathSegs);
+      commitPathSegments(pathSegs, isFilled);
     } else if (
       fn === OPS.moveTo ||
       fn === OPS.lineTo ||
@@ -490,6 +759,480 @@ export function parseOperatorListToSegments(
   return allInternalSegments;
 }
 
+function pointToSegMetrics(
+  px: number,
+  py: number,
+  x1: number,
+  y1: number,
+  x2: number,
+  y2: number
+): { dist: number; tClamped: number; tRaw: number; len: number } {
+  const dx = x2 - x1;
+  const dy = y2 - y1;
+  const lenSq = dx * dx + dy * dy;
+  const len = Math.sqrt(lenSq);
+  if (lenSq <= 1e-9) {
+    return { dist: Math.hypot(px - x1, py - y1), tClamped: 0, tRaw: 0, len: 0 };
+  }
+  const tRaw = ((px - x1) * dx + (py - y1) * dy) / lenSq;
+  const tClamped = Math.max(0, Math.min(1, tRaw));
+  const projX = x1 + tClamped * dx;
+  const projY = y1 + tClamped * dy;
+  return { dist: Math.hypot(px - projX, py - projY), tClamped, tRaw, len };
+}
+
+function isDimensionTextToken(text: string): boolean {
+  const trimmed = text.trim();
+  if (!trimmed || /^\d+(?:\.\d+)?\s*:\s*\d+(?:\.\d+)?$/.test(trimmed)) return false;
+  return (
+    /^(?:[ØøRrMm±]?\s*\d{1,5}(?:\.\d+)?(?:\s*[°"'])?|\d+(?:\.\d+)?\s*[x×]\s*\d+(?:\.\d+)?)$/i.test(
+      trimmed
+    ) || /(?:[Øø°±]\s*\d|\d\s*[Øø°±])/.test(trimmed)
+  );
+}
+
+// shortcut: detects CAD wedge/V-tick arrowheads by subpath shape (<=6.5mm, acute tip 8°-60°) + dim-text/pair anchoring; upgrade if curved/dot tick terminators are needed
+function promoteDimensionGeometry(
+  segments: InternalSegment[],
+  layers: CadLayer[],
+  textItems: RawNormalizedText[],
+  titleBlockTopNy: number,
+  pageWmm: number,
+  pageHmm: number,
+  primaryOutlineWidth: number
+): void {
+  if (segments.length === 0) return;
+
+  const coords = segments.map((s) => {
+    const x1 = s.nx1 * pageWmm;
+    const y1 = s.ny1 * pageHmm;
+    const x2 = s.nx2 * pageWmm;
+    const y2 = s.ny2 * pageHmm;
+    const dx = x2 - x1;
+    const dy = y2 - y1;
+    const len = Math.hypot(dx, dy) || 1e-6;
+    return { x1, y1, x2, y2, dx, dy, ux: dx / len, uy: dy / len, len };
+  });
+
+  const dimTexts = textItems
+    .filter((t) => t.ny < titleBlockTopNy && isDimensionTextToken(t.text))
+    .map((t) => ({ x: t.nx * pageWmm, y: t.ny * pageHmm }));
+
+  // 1. Group into subpaths to detect any-color arrowheads (triangles or V-ticks)
+  const subpathMap = new Map<number, number[]>();
+  for (let i = 0; i < segments.length; i++) {
+    const sid = segments[i].subpathId || -(i + 1);
+    const list = subpathMap.get(sid);
+    if (list) list.push(i);
+    else subpathMap.set(sid, [i]);
+  }
+
+  interface ArrowCandidate {
+    segIndices: number[];
+    tipX: number;
+    tipY: number;
+    axisX: number; // unit vector pointing from tip toward tail/base
+    axisY: number;
+    confirmed: boolean;
+  }
+
+  const arrows: ArrowCandidate[] = [];
+  const arrowSegSet = new Set<number>();
+
+  for (const idxs of subpathMap.values()) {
+    if (idxs.length < 2 || idxs.length > 4) continue;
+    if (segments[idxs[0]].isDashed) continue;
+
+    let minX = Infinity;
+    let minY = Infinity;
+    let maxX = -Infinity;
+    let maxY = -Infinity;
+    let maxLen = 0;
+    for (const idx of idxs) {
+      const c = coords[idx];
+      minX = Math.min(minX, c.x1, c.x2);
+      minY = Math.min(minY, c.y1, c.y2);
+      maxX = Math.max(maxX, c.x1, c.x2);
+      maxY = Math.max(maxY, c.y1, c.y2);
+      maxLen = Math.max(maxLen, c.len);
+    }
+    const span = Math.max(maxX - minX, maxY - minY);
+    if (span < 0.65 || span > 6.5 || maxLen > 6.5) continue;
+
+    // Collect endpoints and test acute wedge vertices formed by two segments meeting at a tip
+    const pts: Array<{ x: number; y: number; others: Array<{ x: number; y: number; len: number }> }> = [];
+    for (const idx of idxs) {
+      const c = coords[idx];
+      const addEnd = (px: number, py: number, ox: number, oy: number) => {
+        const existing = pts.find((p) => Math.hypot(p.x - px, p.y - py) <= 0.35);
+        if (existing) existing.others.push({ x: ox, y: oy, len: c.len });
+        else pts.push({ x: px, y: py, others: [{ x: ox, y: oy, len: c.len }] });
+      };
+      addEnd(c.x1, c.y1, c.x2, c.y2);
+      addEnd(c.x2, c.y2, c.x1, c.y1);
+    }
+
+    let bestTip: ArrowCandidate | null = null;
+    for (const p of pts) {
+      if (p.others.length !== 2) continue;
+      const [a, b] = p.others;
+      if (a.len < 0.6 || b.len < 0.6) continue;
+      const v1x = (a.x - p.x) / a.len;
+      const v1y = (a.y - p.y) / a.len;
+      const v2x = (b.x - p.x) / b.len;
+      const v2y = (b.y - p.y) / b.len;
+      const cosA = v1x * v2x + v1y * v2y;
+      // Acute CAD arrowhead angle ~10°..58° (cos between 0.53 and 0.985)
+      if (cosA >= 0.53 && cosA <= 0.988) {
+        const bx = v1x + v2x;
+        const by = v1y + v2y;
+        const bLen = Math.hypot(bx, by);
+        if (bLen > 1e-4) {
+          bestTip = {
+            segIndices: idxs,
+            tipX: p.x,
+            tipY: p.y,
+            axisX: bx / bLen,
+            axisY: by / bLen,
+            confirmed: false,
+          };
+          break;
+        }
+      }
+    }
+
+    // Require open 2-seg ticks or closed/filled 3-4 seg wedges to avoid stray open corners
+    const isClosedOrFilled = segments[idxs[0]].isFilled || pts.every((p) => p.others.length >= 2);
+    if (bestTip && (idxs.length === 2 || isClosedOrFilled)) {
+      arrows.push(bestTip);
+      for (const idx of idxs) arrowSegSet.add(idx);
+    }
+  }
+
+  if (arrows.length === 0) return;
+
+  // 2. Link arrowheads to collinear dimension/leader lines and anchor via dim text or opposing pairs
+  const arrowToLineIdx = new Map<number, number>();
+  const lineToArrows = new Map<number, number[]>();
+
+  for (let ai = 0; ai < arrows.length; ai++) {
+    const ar = arrows[ai];
+    let bestLine = -1;
+    let bestScore = Infinity;
+    for (let si = 0; si < segments.length; si++) {
+      if (arrowSegSet.has(si) || segments[si].isDashed) continue;
+      const c = coords[si];
+      if (c.len < 2.2) continue;
+      const align = Math.abs(c.ux * ar.axisX + c.uy * ar.axisY);
+      if (align < 0.90) continue;
+      const m = pointToSegMetrics(ar.tipX, ar.tipY, c.x1, c.y1, c.x2, c.y2);
+      if (m.dist <= 1.6 && m.tRaw >= -0.2 && m.tRaw <= 1.2) {
+        if (m.dist < bestScore) {
+          bestScore = m.dist;
+          bestLine = si;
+        }
+      }
+    }
+    if (bestLine !== -1) {
+      arrowToLineIdx.set(ai, bestLine);
+      const list = lineToArrows.get(bestLine);
+      if (list) list.push(ai);
+      else lineToArrows.set(bestLine, [ai]);
+    }
+  }
+
+  const nearDimText = (x: number, y: number, maxDist: number) =>
+    dimTexts.some((t) => Math.hypot(t.x - x, t.y - y) <= maxDist);
+
+  const lineNearDimText = (si: number, maxDist: number) => {
+    const c = coords[si];
+    return dimTexts.some((t) => pointToSegMetrics(t.x, t.y, c.x1, c.y1, c.x2, c.y2).dist <= maxDist);
+  };
+
+  for (let ai = 0; ai < arrows.length; ai++) {
+    const ar = arrows[ai];
+    const attachedLine = arrowToLineIdx.get(ai);
+    const hasPairedArrow =
+      (attachedLine !== undefined && (lineToArrows.get(attachedLine)?.length ?? 0) >= 2) ||
+      arrows.some((other, oi) => {
+        if (oi === ai) return false;
+        const dotAxis = ar.axisX * other.axisX + ar.axisY * other.axisY;
+        if (dotAxis > -0.88) return false;
+        const dx = other.tipX - ar.tipX;
+        const dy = other.tipY - ar.tipY;
+        const span = Math.hypot(dx, dy);
+        if (span < 3 || span > 260) return false;
+        const perp = Math.abs(dx * -ar.axisY + dy * ar.axisX);
+        return perp <= 2.2;
+      });
+
+    const hasTextAnchor =
+      nearDimText(ar.tipX, ar.tipY, 26) ||
+      (attachedLine !== undefined && lineNearDimText(attachedLine, 12));
+
+    if (hasPairedArrow || hasTextAnchor) {
+      ar.confirmed = true;
+    }
+  }
+
+  const confirmedArrows = arrows.filter((a) => a.confirmed);
+  if (confirmedArrows.length === 0) return;
+
+  const promotedLines = new Set<number>();
+
+  for (let ai = 0; ai < arrows.length; ai++) {
+    const ar = arrows[ai];
+    if (!ar.confirmed) continue;
+    for (const idx of ar.segIndices) layers[idx] = 'dimension';
+    const si = arrowToLineIdx.get(ai);
+    if (si !== undefined) {
+      layers[si] = 'dimension';
+      promotedLines.add(si);
+    }
+  }
+
+  // Promote leader text shelves / gap-split collinear span lines attached to confirmed dimension lines
+  const basePromoted = Array.from(promotedLines);
+  for (const di of basePromoted) {
+    const dc = coords[di];
+    for (let si = 0; si < segments.length; si++) {
+      if (arrowSegSet.has(si) || layers[si] === 'dimension' || segments[si].isDashed) continue;
+      if (segments[si].pathSegCount > 2) continue;
+      const c = coords[si];
+      const touchesStart = Math.hypot(c.x1 - dc.x1, c.y1 - dc.y1) <= 1.2 || Math.hypot(c.x1 - dc.x2, c.y1 - dc.y2) <= 1.2;
+      const touchesEnd = Math.hypot(c.x2 - dc.x1, c.y2 - dc.y1) <= 1.2 || Math.hypot(c.x2 - dc.x2, c.y2 - dc.y2) <= 1.2;
+      if ((touchesStart || touchesEnd) && c.len <= 28 && lineNearDimText(si, 8)) {
+        layers[si] = 'dimension';
+        promotedLines.add(si);
+        continue;
+      }
+      // Gap-split dimension line bridging numeric text
+      if (
+        Math.abs(c.ux * dc.ux + c.uy * dc.uy) >= 0.96 &&
+        pointToSegMetrics(c.x1, c.y1, dc.x1, dc.y1, dc.x2, dc.y2).dist <= 18 &&
+        Math.abs((c.x1 - dc.x1) * -dc.uy + (c.y1 - dc.y1) * dc.ux) <= 1.0 &&
+        lineNearDimText(si, 12)
+      ) {
+        layers[si] = 'dimension';
+        promotedLines.add(si);
+      }
+    }
+  }
+
+  // 3. Detect orthogonal extension (witness) lines framing confirmed arrowheads
+  for (let si = 0; si < segments.length; si++) {
+    if (arrowSegSet.has(si) || layers[si] === 'dimension' || segments[si].isDashed) continue;
+    if (segments[si].pathSegCount > 2) continue;
+    const c = coords[si];
+    if (c.len < 2.0) continue;
+
+    const isThin = segments[si].effLineWidth <= primaryOutlineWidth * 0.90;
+    const isWitness = confirmedArrows.some((ar) => {
+      const cosOrth = Math.abs(c.ux * ar.axisX + c.uy * ar.axisY);
+      if (cosOrth > 0.42) return false; // requires ~65°..115° to dimension axis
+      const m = pointToSegMetrics(ar.tipX, ar.tipY, c.x1, c.y1, c.x2, c.y2);
+      if (m.dist > 1.8) return false;
+      const distFromNearestEnd = Math.min(m.tClamped, 1 - m.tClamped) * c.len;
+      const hasWitnessOvershoot = distFromNearestEnd >= 0.35 && distFromNearestEnd <= 5.2;
+      return hasWitnessOvershoot || (isThin && distFromNearestEnd <= 5.5);
+    });
+
+    if (isWitness) {
+      layers[si] = 'dimension';
+    }
+  }
+}
+
+interface CollinearEndpoint {
+  xMm: number;
+  yMm: number;
+  nx: number;
+  ny: number;
+}
+
+function makeStrokeStyleKey(seg: InternalSegment): string {
+  return `${seg.effLineWidth.toFixed(2)}:${seg.strokeLuminance.toFixed(2)}:${seg.isDashed ? 1 : 0}`;
+}
+
+function mergeCollinearSegments(segments: RawNormalizedSegment[]): RawNormalizedSegment[] {
+  if (segments.length <= 1) return segments;
+
+  const groups = new Map<string, RawNormalizedSegment[]>();
+  for (const s of segments) {
+    const key = `${s.layerHint || 'outline'}|${s.strokeStyleKey || 'default'}`;
+    const bucket = groups.get(key);
+    if (bucket) bucket.push(s);
+    else groups.set(key, [s]);
+  }
+
+  const out: RawNormalizedSegment[] = [];
+
+  for (const group of groups.values()) {
+    if (group.length <= 1) {
+      for (const s of group) out.push(s);
+      continue;
+    }
+
+    interface LineItem {
+      angleBucket: number;
+      ux: number;
+      uy: number;
+      d: number;
+      minT: number;
+      maxT: number;
+      pMin: CollinearEndpoint;
+      pMax: CollinearEndpoint;
+      layerHint?: CadLayer;
+      strokeStyleKey?: string;
+    }
+
+    const items: LineItem[] = [];
+    for (const s of group) {
+      const dx = s.x2Mm - s.x1Mm;
+      const dy = s.y2Mm - s.y1Mm;
+      const len = Math.hypot(dx, dy);
+      if (len <= 1e-4) continue;
+      let ux = dx / len;
+      let uy = dy / len;
+      if (ux < -1e-6 || (Math.abs(ux) <= 1e-6 && uy < 0)) {
+        ux = -ux;
+        uy = -uy;
+      }
+      let deg = (Math.atan2(uy, ux) * 180) / Math.PI;
+      if (deg < 0) deg += 180;
+      if (deg >= 179.75) deg = 0;
+      const angleBucket = Math.round(deg * 2) % 360;
+      const nX = -uy;
+      const nY = ux;
+      const d = s.x1Mm * nX + s.y1Mm * nY;
+      const t1 = s.x1Mm * ux + s.y1Mm * uy;
+      const t2 = s.x2Mm * ux + s.y2Mm * uy;
+      const e1: CollinearEndpoint = { xMm: s.x1Mm, yMm: s.y1Mm, nx: s.nx1, ny: s.ny1 };
+      const e2: CollinearEndpoint = { xMm: s.x2Mm, yMm: s.y2Mm, nx: s.nx2, ny: s.ny2 };
+      const [minT, pMin, maxT, pMax] = t1 <= t2 ? [t1, e1, t2, e2] : [t2, e2, t1, e1];
+      items.push({
+        angleBucket,
+        ux,
+        uy,
+        d,
+        minT,
+        maxT,
+        pMin,
+        pMax,
+        layerHint: s.layerHint,
+        strokeStyleKey: s.strokeStyleKey,
+      });
+    }
+
+    items.sort((a, b) =>
+      a.angleBucket !== b.angleBucket
+        ? a.angleBucket - b.angleBucket
+        : Math.abs(a.d - b.d) > 0.05
+          ? a.d - b.d
+          : a.minT - b.minT
+    );
+
+    const active: LineItem[] = [];
+    const flushItem = (it: LineItem) => {
+      out.push({
+        nx1: it.pMin.nx,
+        ny1: it.pMin.ny,
+        nx2: it.pMax.nx,
+        ny2: it.pMax.ny,
+        x1Mm: Number(it.pMin.xMm.toFixed(3)),
+        y1Mm: Number(it.pMin.yMm.toFixed(3)),
+        x2Mm: Number(it.pMax.xMm.toFixed(3)),
+        y2Mm: Number(it.pMax.yMm.toFixed(3)),
+        layerHint: it.layerHint,
+        strokeStyleKey: it.strokeStyleKey,
+      });
+    };
+
+    for (const it of items) {
+      while (
+        active.length > 0 &&
+        (active[0].angleBucket !== it.angleBucket || it.d - active[0].d > 0.06)
+      ) {
+        flushItem(active.shift()!);
+      }
+
+      let merged = false;
+      for (let ai = active.length - 1; ai >= 0; ai--) {
+        const cur = active[ai];
+        const dot = cur.ux * it.ux + cur.uy * it.uy;
+        if (Math.abs(dot) < 0.9999) continue;
+        const cNx = -cur.uy;
+        const cNy = cur.ux;
+        const perp1 = Math.abs((it.pMin.xMm - cur.pMin.xMm) * cNx + (it.pMin.yMm - cur.pMin.yMm) * cNy);
+        const perp2 = Math.abs((it.pMax.xMm - cur.pMin.xMm) * cNx + (it.pMax.yMm - cur.pMin.yMm) * cNy);
+        if (perp1 > 0.045 || perp2 > 0.045) continue;
+        if (it.minT <= cur.maxT + 0.06 && it.maxT >= cur.minT - 0.06) {
+          if (it.minT < cur.minT) {
+            cur.minT = it.minT;
+            cur.pMin = it.pMin;
+          }
+          if (it.maxT > cur.maxT) {
+            cur.maxT = it.maxT;
+            cur.pMax = it.pMax;
+          }
+          merged = true;
+          break;
+        }
+      }
+      if (!merged) active.push(it);
+    }
+
+    for (const rem of active) flushItem(rem);
+  }
+
+  return out;
+}
+
+function compactSegmentsForCap(
+  segments: RawNormalizedSegment[],
+  cap: number,
+  scaleFactor = 1
+): { segments: RawNormalizedSegment[]; truncated: boolean; droppedSegmentCount: number } {
+  const merged = mergeCollinearSegments(segments);
+  if (merged.length <= cap) {
+    return { segments: merged, truncated: false, droppedSegmentCount: 0 };
+  }
+
+  const longSegs: Array<{ seg: RawNormalizedSegment; lenMm: number }> = [];
+  const shortSegs: Array<{ seg: RawNormalizedSegment; lenMm: number }> = [];
+  const effScale = Number.isFinite(scaleFactor) && scaleFactor > 0 ? scaleFactor : 1;
+
+  for (const seg of merged) {
+    const lenMm = Math.hypot(seg.x2Mm - seg.x1Mm, seg.y2Mm - seg.y1Mm);
+    if (lenMm * effScale >= 1.0) {
+      longSegs.push({ seg, lenMm });
+    } else {
+      shortSegs.push({ seg, lenMm });
+    }
+  }
+
+  let retained: RawNormalizedSegment[];
+  if (longSegs.length <= cap) {
+    shortSegs.sort((a, b) => b.lenMm - a.lenMm);
+    const shortBudget = cap - longSegs.length;
+    retained = longSegs.map((x) => x.seg);
+    for (let i = 0; i < shortBudget && i < shortSegs.length; i++) {
+      retained.push(shortSegs[i].seg);
+    }
+  } else {
+    // shortcut: enforces cap by dropping shortest >=1mm segments when >cap macro segments exist; raise MAX_*_VECTOR_SEGMENTS if denser sheets need more
+    longSegs.sort((a, b) => b.lenMm - a.lenMm);
+    retained = longSegs.slice(0, cap).map((x) => x.seg);
+  }
+
+  const droppedSegmentCount = Math.max(0, merged.length - retained.length);
+  return {
+    segments: retained,
+    truncated: droppedSegmentCount > 0,
+    droppedSegmentCount,
+  };
+}
+
 export function buildPayloadGeometry(
   allInternalSegments: InternalSegment[],
   rawNormalizedTextItems: RawNormalizedText[],
@@ -505,10 +1248,17 @@ export function buildPayloadGeometry(
   titleBlockMeta: PdfTitleBlockMeta;
   detectedScaleLabel?: string;
   detectedScaleFactor?: number;
+  truncated: boolean;
+  droppedSegmentCount: number;
 } {
   const titleBlockTopNy = detectTitleBlockTopNy(allInternalSegments, rawNormalizedTextItems);
+  const chromeCtx = detectSheetChromeContext(
+    allInternalSegments,
+    rawNormalizedTextItems,
+    titleBlockTopNy
+  );
   const drawingSegments = allInternalSegments.filter(
-    (seg) => !isSheetChromeSegment(seg, titleBlockTopNy)
+    (seg) => !isSheetChromeSegment(seg, titleBlockTopNy, chromeCtx)
   );
 
   const darkWidths = drawingSegments
@@ -516,7 +1266,18 @@ export function buildPayloadGeometry(
     .map((s) => s.effLineWidth);
   const primaryOutlineWidth = darkWidths.length > 0 ? Math.max(...darkWidths) : 0.6;
 
-  const rawNormalizedSegments: RawNormalizedSegment[] = drawingSegments.map((seg) => ({
+  const drawingLayers = drawingSegments.map((seg) => classifySegmentLayer(seg, primaryOutlineWidth));
+  promoteDimensionGeometry(
+    drawingSegments,
+    drawingLayers,
+    rawNormalizedTextItems,
+    titleBlockTopNy,
+    pageWidthPt * PT_TO_MM,
+    pageHeightPt * PT_TO_MM,
+    primaryOutlineWidth
+  );
+
+  const allNormalizedSegments: RawNormalizedSegment[] = drawingSegments.map((seg, idx) => ({
     nx1: seg.nx1,
     ny1: seg.ny1,
     nx2: seg.nx2,
@@ -525,27 +1286,37 @@ export function buildPayloadGeometry(
     y1Mm: seg.y1Mm,
     x2Mm: seg.x2Mm,
     y2Mm: seg.y2Mm,
-    layerHint: classifySegmentLayer(seg, primaryOutlineWidth),
+    layerHint: drawingLayers[idx],
+    strokeStyleKey: makeStrokeStyleKey(seg),
   }));
 
-  const titleBlockMeta = parseTitleBlockMetadata(rawNormalizedTextItems, rawNormalizedSegments);
+  const prelimTitleMeta = parseTitleBlockMetadata(rawNormalizedTextItems, allNormalizedSegments);
+  const compactedTotal = compactSegmentsForCap(
+    allNormalizedSegments,
+    MAX_TOTAL_VECTOR_SEGMENTS,
+    prelimTitleMeta.scaleFactor || 1
+  );
+  const retainedSegs = compactedTotal.segments;
+
+  const titleBlockMeta = parseTitleBlockMetadata(rawNormalizedTextItems, retainedSegs);
   const detectedSpecs = detectViewRegions(
-    rawNormalizedSegments,
+    retainedSegs,
     rawNormalizedTextItems,
     titleBlockTopNy
   );
-  const viewChunks = buildViewChunksFromSpecs(
+  const chunkBuild = buildViewChunksWithStats(
     detectedSpecs,
     pageNumber,
     pageWidthPt,
     pageHeightPt,
-    rawNormalizedSegments,
+    retainedSegs,
     rawNormalizedTextItems,
-    cropImage
+    cropImage,
+    titleBlockMeta.scaleFactor || 1
   );
+  const viewChunks = chunkBuild.chunks;
   const calibrated = calibrateScaleFromViewChunks(viewChunks, titleBlockMeta);
 
-  const retainedSegs = rawNormalizedSegments.slice(0, 4000);
   const outlineForBB = retainedSegs.filter((s) => s.layerHint === 'outline' || s.layerHint === 'hidden');
   const structuralForBB = retainedSegs.filter((s) => s.layerHint !== 'dimension');
   const bbSegs =
@@ -583,8 +1354,10 @@ export function buildPayloadGeometry(
     y2: Number((s.y2Mm - centerY).toFixed(3)),
   }));
 
+  const droppedSegmentCount = compactedTotal.droppedSegmentCount + chunkBuild.droppedSegmentCount;
+
   return {
-    rawNormalizedSegments,
+    rawNormalizedSegments: retainedSegs,
     viewChunks,
     centeredEntities,
     vectorBoundingBox: {
@@ -600,6 +1373,8 @@ export function buildPayloadGeometry(
     },
     detectedScaleLabel: calibrated.scaleLabel,
     detectedScaleFactor: calibrated.scaleFactor,
+    truncated: droppedSegmentCount > 0,
+    droppedSegmentCount,
   };
 }
 
@@ -951,7 +1726,7 @@ export function detectViewRegions(
   });
 }
 
-export function buildViewChunksFromSpecs(
+function buildViewChunksWithStats(
   specs: Array<{
     id?: string;
     label: string;
@@ -963,10 +1738,12 @@ export function buildViewChunksFromSpecs(
   pageHeightPt: number,
   segments: RawNormalizedSegment[],
   textItems: RawNormalizedText[],
-  cropImage: (normBounds: NormalizedRect) => string
-): PdfViewChunk[] {
+  cropImage: (normBounds: NormalizedRect) => string,
+  scaleFactor = 1
+): { chunks: PdfViewChunk[]; droppedSegmentCount: number } {
   const pageWmm = pageWidthPt * PT_TO_MM;
   const pageHmm = pageHeightPt * PT_TO_MM;
+  let droppedSegmentCount = 0;
 
   const chunkBuckets: RawNormalizedSegment[][] = specs.map(() => []);
   for (const s of segments) {
@@ -989,7 +1766,7 @@ export function buildViewChunksFromSpecs(
     }
   }
 
-  return specs.map((spec, idx) => {
+  const chunks = specs.map((spec, idx) => {
     const id = spec.id || `view-${idx + 1}`;
     const b = spec.normBounds;
     const croppedImageDataUrl = cropImage(b);
@@ -1004,7 +1781,14 @@ export function buildViewChunksFromSpecs(
       )
       .map((t) => t.text);
 
-    const enclosedSegs = chunkBuckets[idx];
+    const compactedChunk = compactSegmentsForCap(
+      chunkBuckets[idx],
+      MAX_CHUNK_VECTOR_SEGMENTS,
+      scaleFactor
+    );
+    droppedSegmentCount += compactedChunk.droppedSegmentCount;
+    const enclosedSegs = compactedChunk.segments;
+
     const outlineSegs = enclosedSegs.filter((s) => s.layerHint === 'outline' || s.layerHint === 'hidden');
     const structuralSegs = enclosedSegs.filter((s) => s.layerHint !== 'dimension');
     const boundsSegs =
@@ -1031,7 +1815,7 @@ export function buildViewChunksFromSpecs(
     const cx = (minX + maxX) / 2;
     const cy = (minY + maxY) / 2;
 
-    const vectorEntities: CadEntity[] = enclosedSegs.slice(0, 2500).map((s, sIdx) => ({
+    const vectorEntities: CadEntity[] = enclosedSegs.map((s, sIdx) => ({
       id: `${id}-vec-${sIdx + 1}`,
       viewId: id,
       layer: s.layerHint || 'outline',
@@ -1063,6 +1847,33 @@ export function buildViewChunksFromSpecs(
       },
     };
   });
+
+  return { chunks, droppedSegmentCount };
+}
+
+export function buildViewChunksFromSpecs(
+  specs: Array<{
+    id?: string;
+    label: string;
+    viewKind: ViewChunkKind;
+    normBounds: NormalizedRect;
+  }>,
+  pageNumber: number,
+  pageWidthPt: number,
+  pageHeightPt: number,
+  segments: RawNormalizedSegment[],
+  textItems: RawNormalizedText[],
+  cropImage: (normBounds: NormalizedRect) => string
+): PdfViewChunk[] {
+  return buildViewChunksWithStats(
+    specs,
+    pageNumber,
+    pageWidthPt,
+    pageHeightPt,
+    segments,
+    textItems,
+    cropImage
+  ).chunks;
 }
 
 function extractNumericDimCallouts(tokens: string[]): number[] {

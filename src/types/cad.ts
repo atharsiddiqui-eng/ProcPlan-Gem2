@@ -58,6 +58,7 @@ export interface RawNormalizedSegment {
   x2Mm: number;
   y2Mm: number;
   layerHint?: CadLayer;
+  strokeStyleKey?: string;
 }
 
 export interface RawNormalizedText {
@@ -264,6 +265,8 @@ export interface PdfExtractionPayload {
   detectedScaleLabel?: string;
   detectedScaleFactor?: number;
   titleBlockMeta?: PdfTitleBlockMeta;
+  truncated: boolean;
+  droppedSegmentCount: number;
 }
 
 export interface MaterialMachiningPreset {

@@ -115,11 +115,13 @@ export async function extractPdfPage(
     vectorBoundingBox: geom.vectorBoundingBox,
     hasMultipleViews: geom.viewChunks.length > 1,
     viewChunks: geom.viewChunks,
-    rawNormalizedSegments: geom.rawNormalizedSegments.slice(0, 6000),
+    rawNormalizedSegments: geom.rawNormalizedSegments,
     rawNormalizedTextItems: rawNormalizedTextItems.slice(0, 600),
     detectedScaleLabel: geom.detectedScaleLabel,
     detectedScaleFactor: geom.detectedScaleFactor,
     titleBlockMeta: geom.titleBlockMeta,
+    truncated: geom.truncated,
+    droppedSegmentCount: geom.droppedSegmentCount,
   };
 }
 

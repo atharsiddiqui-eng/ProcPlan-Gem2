@@ -317,7 +317,7 @@ export function generateToolpathOverlay(
         : visibleEntities.filter((e) => e.layer === 'outline' || e.layer === 'hole').slice(0, 4);
 
     for (const ent of targetEntities) {
-      if (ent.layer === 'centerline' || ent.layer === 'hidden') continue;
+      if (ent.layer === 'centerline' || ent.layer === 'hidden' || ent.layer === 'dimension') continue;
 
       if (ent.type === 'circle') {
         if (!isValidNum(ent.cx) || !isValidNum(ent.cy) || !isValidNum(ent.r) || ent.r <= 0) continue;
@@ -440,15 +440,18 @@ export function exportToDxf(analysis: DrawingAnalysisResult): string {
   ];
 
   const layerName = (l: string) => l.toUpperCase();
+  const layerAciColor = (l: string) =>
+    l === 'dimension' ? '30' : l === 'hole' ? '4' : l === 'centerline' ? '8' : l === 'hidden' ? '9' : '7';
 
   for (const ent of analysis.entities) {
     const layer = layerName(ent.layer);
+    const aci = layerAciColor(ent.layer);
     if (ent.type === 'line') {
-      lines.push('0', 'LINE', '8', layer, '10', ent.x1.toFixed(4), '20', ent.y1.toFixed(4), '30', '0.0', '11', ent.x2.toFixed(4), '21', ent.y2.toFixed(4), '31', '0.0');
+      lines.push('0', 'LINE', '8', layer, '62', aci, '10', ent.x1.toFixed(4), '20', ent.y1.toFixed(4), '30', '0.0', '11', ent.x2.toFixed(4), '21', ent.y2.toFixed(4), '31', '0.0');
     } else if (ent.type === 'circle') {
-      lines.push('0', 'CIRCLE', '8', layer, '10', ent.cx.toFixed(4), '20', ent.cy.toFixed(4), '30', '0.0', '40', ent.r.toFixed(4));
+      lines.push('0', 'CIRCLE', '8', layer, '62', aci, '10', ent.cx.toFixed(4), '20', ent.cy.toFixed(4), '30', '0.0', '40', ent.r.toFixed(4));
     } else if (ent.type === 'arc') {
-      lines.push('0', 'ARC', '8', layer, '10', ent.cx.toFixed(4), '20', ent.cy.toFixed(4), '30', '0.0', '40', ent.r.toFixed(4), '50', ent.startAngle.toFixed(2), '51', ent.endAngle.toFixed(2));
+      lines.push('0', 'ARC', '8', layer, '62', aci, '10', ent.cx.toFixed(4), '20', ent.cy.toFixed(4), '30', '0.0', '40', ent.r.toFixed(4), '50', ent.startAngle.toFixed(2), '51', ent.endAngle.toFixed(2));
     } else if (ent.type === 'rect') {
       const pts = [
         [ent.x, ent.y],
@@ -459,14 +462,14 @@ export function exportToDxf(analysis: DrawingAnalysisResult): string {
       for (let i = 0; i < 4; i++) {
         const a = pts[i];
         const b = pts[(i + 1) % 4];
-        lines.push('0', 'LINE', '8', layer, '10', a[0].toFixed(4), '20', a[1].toFixed(4), '30', '0.0', '11', b[0].toFixed(4), '21', b[1].toFixed(4), '31', '0.0');
+        lines.push('0', 'LINE', '8', layer, '62', aci, '10', a[0].toFixed(4), '20', a[1].toFixed(4), '30', '0.0', '11', b[0].toFixed(4), '21', b[1].toFixed(4), '31', '0.0');
       }
     } else if (ent.type === 'polyline' && ent.points.length > 1) {
       const count = ent.closed ? ent.points.length : ent.points.length - 1;
       for (let i = 0; i < count; i++) {
         const a = ent.points[i];
         const b = ent.points[(i + 1) % ent.points.length];
-        lines.push('0', 'LINE', '8', layer, '10', a.x.toFixed(4), '20', a.y.toFixed(4), '30', '0.0', '11', b.x.toFixed(4), '21', b.y.toFixed(4), '31', '0.0');
+        lines.push('0', 'LINE', '8', layer, '62', aci, '10', a.x.toFixed(4), '20', a.y.toFixed(4), '30', '0.0', '11', b.x.toFixed(4), '21', b.y.toFixed(4), '31', '0.0');
       }
     }
   }
@@ -486,31 +489,34 @@ export function exportToSvg(analysis: DrawingAnalysisResult): string {
   const elements: string[] = [];
   for (const ent of analysis.entities) {
     const stroke =
-      ent.layer === 'centerline'
-        ? '#64748b'
-        : ent.layer === 'hidden'
-          ? '#94a3b8'
-          : ent.layer === 'hole'
-            ? '#0284c7'
-            : '#0f172a';
+      ent.layer === 'dimension'
+        ? '#b45309'
+        : ent.layer === 'centerline'
+          ? '#64748b'
+          : ent.layer === 'hidden'
+            ? '#94a3b8'
+            : ent.layer === 'hole'
+              ? '#0284c7'
+              : '#0f172a';
     const dash =
       ent.layer === 'centerline'
         ? ' stroke-dasharray="6 3 2 3"'
         : ent.layer === 'hidden'
           ? ' stroke-dasharray="4 3"'
           : '';
-    const sw = ent.layer === 'centerline' ? 0.35 : 0.7;
+    const sw = ent.layer === 'centerline' || ent.layer === 'dimension' ? 0.35 : 0.7;
+    const layerAttr = ` data-layer="${ent.layer.toUpperCase()}"`;
 
     if (ent.type === 'line') {
-      elements.push(`<line x1="${ent.x1}" y1="${-ent.y1}" x2="${ent.x2}" y2="${-ent.y2}" stroke="${stroke}" stroke-width="${sw}"${dash} />`);
+      elements.push(`<line${layerAttr} x1="${ent.x1}" y1="${-ent.y1}" x2="${ent.x2}" y2="${-ent.y2}" stroke="${stroke}" stroke-width="${sw}"${dash} />`);
     } else if (ent.type === 'circle') {
-      elements.push(`<circle cx="${ent.cx}" cy="${-ent.cy}" r="${ent.r}" fill="none" stroke="${stroke}" stroke-width="${sw}"${dash} />`);
+      elements.push(`<circle${layerAttr} cx="${ent.cx}" cy="${-ent.cy}" r="${ent.r}" fill="none" stroke="${stroke}" stroke-width="${sw}"${dash} />`);
     } else if (ent.type === 'rect') {
-      elements.push(`<rect x="${ent.x}" y="${-(ent.y + ent.height)}" width="${ent.width}" height="${ent.height}" rx="${ent.rx || 0}" fill="none" stroke="${stroke}" stroke-width="${sw}"${dash} />`);
+      elements.push(`<rect${layerAttr} x="${ent.x}" y="${-(ent.y + ent.height)}" width="${ent.width}" height="${ent.height}" rx="${ent.rx || 0}" fill="none" stroke="${stroke}" stroke-width="${sw}"${dash} />`);
     } else if (ent.type === 'polyline' && ent.points.length > 1) {
       const pts = ent.points.map((p) => `${p.x},${-p.y}`).join(' ');
       const tag = ent.closed ? 'polygon' : 'polyline';
-      elements.push(`<${tag} points="${pts}" fill="none" stroke="${stroke}" stroke-width="${sw}"${dash} />`);
+      elements.push(`<${tag}${layerAttr} points="${pts}" fill="none" stroke="${stroke}" stroke-width="${sw}"${dash} />`);
     }
   }
 

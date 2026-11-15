@@ -434,15 +434,17 @@ export const CadPlotCanvas: React.FC<CadPlotCanvasProps> = ({
       ? colors.highlight
       : ent.layer === 'hole'
         ? colors.hole
-        : ent.layer === 'centerline'
-          ? colors.centerline
-          : ent.layer === 'hidden'
-            ? colors.hidden
-            : colors.outline;
+        : ent.layer === 'dimension'
+          ? colors.dimension
+          : ent.layer === 'centerline'
+            ? colors.centerline
+            : ent.layer === 'hidden'
+              ? colors.hidden
+              : colors.outline;
 
     const strokeWidth = isSelected
       ? strokeWidthBase * 1.9
-      : ent.layer === 'centerline' || ent.layer === 'hidden'
+      : ent.layer === 'centerline' || ent.layer === 'hidden' || ent.layer === 'dimension'
         ? thinStroke
         : strokeWidthBase;
 
