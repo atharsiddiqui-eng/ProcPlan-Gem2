@@ -48,6 +48,8 @@ export function sanitizeAnalysisResult(raw: Partial<DrawingAnalysisResult>): Dra
     const layer: CadLayer = VALID_LAYERS.has(e.layer as CadLayer)
       ? (e.layer as CadLayer)
       : 'outline';
+    const source: 'vector' | 'recovered' | undefined =
+      e.source === 'vector' || e.source === 'recovered' ? e.source : undefined;
     const type = e.type;
 
     if (type === 'line') {
@@ -56,14 +58,14 @@ export function sanitizeAnalysisResult(raw: Partial<DrawingAnalysisResult>): Dra
       const x2 = Number(e.x2);
       const y2 = Number(e.y2);
       if (isFiniteNum(x1) && isFiniteNum(y1) && isFiniteNum(x2) && isFiniteNum(y2)) {
-        entities.push({ id, featureId, viewId, layer, type: 'line', x1, y1, x2, y2 });
+        entities.push({ id, featureId, viewId, layer, ...(source ? { source } : {}), type: 'line', x1, y1, x2, y2 });
       }
     } else if (type === 'circle') {
       const cx = Number(e.cx);
       const cy = Number(e.cy);
       const r = Number(e.r);
       if (isFiniteNum(cx) && isFiniteNum(cy) && isFiniteNum(r) && r > 0) {
-        entities.push({ id, featureId, viewId, layer, type: 'circle', cx, cy, r });
+        entities.push({ id, featureId, viewId, layer, ...(source ? { source } : {}), type: 'circle', cx, cy, r });
       }
     } else if (type === 'arc') {
       const cx = Number(e.cx);
@@ -72,7 +74,7 @@ export function sanitizeAnalysisResult(raw: Partial<DrawingAnalysisResult>): Dra
       const startAngle = num(e.startAngle, 0);
       const endAngle = num(e.endAngle, 90);
       if (isFiniteNum(cx) && isFiniteNum(cy) && isFiniteNum(r) && r > 0) {
-        entities.push({ id, featureId, viewId, layer, type: 'arc', cx, cy, r, startAngle, endAngle });
+        entities.push({ id, featureId, viewId, layer, ...(source ? { source } : {}), type: 'arc', cx, cy, r, startAngle, endAngle });
       }
     } else if (type === 'rect') {
       const x = Number(e.x);
@@ -88,7 +90,7 @@ export function sanitizeAnalysisResult(raw: Partial<DrawingAnalysisResult>): Dra
         width > 0 &&
         height > 0
       ) {
-        entities.push({ id, featureId, viewId, layer, type: 'rect', x, y, width, height, rx });
+        entities.push({ id, featureId, viewId, layer, ...(source ? { source } : {}), type: 'rect', x, y, width, height, rx });
       }
     } else if (type === 'polyline' && Array.isArray(e.points)) {
       const points = e.points
@@ -105,6 +107,7 @@ export function sanitizeAnalysisResult(raw: Partial<DrawingAnalysisResult>): Dra
           featureId,
           viewId,
           layer,
+          ...(source ? { source } : {}),
           type: 'polyline',
           points,
           closed: Boolean(e.closed),

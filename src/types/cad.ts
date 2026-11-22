@@ -59,6 +59,7 @@ export interface RawNormalizedSegment {
   y2Mm: number;
   layerHint?: CadLayer;
   strokeStyleKey?: string;
+  subpathId?: number;
 }
 
 export interface RawNormalizedText {
@@ -72,6 +73,7 @@ export interface CadLineEntity {
   featureId?: string;
   viewId?: string;
   layer: CadLayer;
+  source?: 'vector' | 'recovered';
   type: 'line';
   x1: number;
   y1: number;
@@ -84,6 +86,7 @@ export interface CadCircleEntity {
   featureId?: string;
   viewId?: string;
   layer: CadLayer;
+  source?: 'vector' | 'recovered';
   type: 'circle';
   cx: number;
   cy: number;
@@ -95,6 +98,7 @@ export interface CadArcEntity {
   featureId?: string;
   viewId?: string;
   layer: CadLayer;
+  source?: 'vector' | 'recovered';
   type: 'arc';
   cx: number;
   cy: number;
@@ -108,6 +112,7 @@ export interface CadRectEntity {
   featureId?: string;
   viewId?: string;
   layer: CadLayer;
+  source?: 'vector' | 'recovered';
   type: 'rect';
   x: number;
   y: number;
@@ -121,6 +126,7 @@ export interface CadPolylineEntity {
   featureId?: string;
   viewId?: string;
   layer: CadLayer;
+  source?: 'vector' | 'recovered';
   type: 'polyline';
   points: { x: number; y: number }[];
   closed?: boolean;

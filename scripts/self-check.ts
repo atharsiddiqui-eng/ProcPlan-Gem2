@@ -14,73 +14,105 @@ import {
 import {
   buildPayloadGeometry,
   buildRawVectorAnalysis,
+  calibrateScaleFromViewChunks,
   detectViewRegions,
+  extractNumericDimCallouts,
+  inferSheetSizeMm,
   MAX_CHUNK_VECTOR_SEGMENTS,
   MAX_TOTAL_VECTOR_SEGMENTS,
   parseOperatorListToSegments,
+  parseTitleBlockMetadata,
+  PT_TO_MM,
+  recoverPrimitivesFromSegments,
 } from '../src/utils/pdfVectorCore';
+import { generateSampleMechanicalPdfBytes, SAMPLE_DRAWINGS } from '../src/utils/sampleDrawings';
 import { sanitizeAnalysisResult } from '../src/utils/sanitizeAnalysis';
-import type { PdfExtractionPayload, RawNormalizedSegment, RawNormalizedText } from '../src/types/cad';
+import type {
+  CadArcEntity,
+  CadCircleEntity,
+  CadLineEntity,
+  CadPolylineEntity,
+  PdfExtractionPayload,
+  RawNormalizedSegment,
+  RawNormalizedText,
+} from '../src/types/cad';
+
+async function extractPayloadFromPdfBytes(
+  bytes: Uint8Array,
+  fileName: string,
+  pageNumber = 1
+): Promise<PdfExtractionPayload> {
+  const loadingTask = pdfjsLib.getDocument({ data: bytes, verbosity: 0 });
+  const pdf = await loadingTask.promise;
+  try {
+    const page = await pdf.getPage(pageNumber);
+    try {
+      const baseViewport = page.getViewport({ scale: 1 });
+      const viewport = page.getViewport({ scale: 1.5 });
+
+      const textContent = await page.getTextContent();
+      const extractedText: string[] = [];
+      const rawNormalizedTextItems: RawNormalizedText[] = [];
+      for (const item of textContent.items) {
+        if ('str' in item && typeof item.str === 'string') {
+          const cleaned = item.str.trim();
+          if (!cleaned) continue;
+          extractedText.push(cleaned);
+          const tx = item.transform?.[4] ?? 0;
+          const ty = item.transform?.[5] ?? 0;
+          const [vx, vy] = viewport.convertToViewportPoint(tx, ty);
+          rawNormalizedTextItems.push({
+            text: cleaned,
+            nx: Math.max(0, Math.min(1, vx / viewport.width)),
+            ny: Math.max(0, Math.min(1, vy / viewport.height)),
+          });
+        }
+      }
+
+      const ops = await page.getOperatorList();
+      const internalSegments = parseOperatorListToSegments(ops, pdfjsLib.OPS, viewport);
+      const geom = buildPayloadGeometry(
+        internalSegments,
+        rawNormalizedTextItems,
+        pageNumber,
+        baseViewport.width,
+        baseViewport.height,
+        () => ''
+      );
+
+      return {
+        fileName,
+        pageCount: pdf.numPages,
+        selectedPage: pageNumber,
+        pageWidthPt: baseViewport.width,
+        pageHeightPt: baseViewport.height,
+        renderedImageDataUrl: '',
+        extractedText,
+        vectorEntityCount: geom.centeredEntities.length,
+        vectorEntities: geom.centeredEntities,
+        vectorBoundingBox: geom.vectorBoundingBox,
+        hasMultipleViews: geom.viewChunks.length > 1,
+        viewChunks: geom.viewChunks,
+        rawNormalizedSegments: geom.rawNormalizedSegments,
+        rawNormalizedTextItems: rawNormalizedTextItems.slice(0, 600),
+        detectedScaleLabel: geom.detectedScaleLabel,
+        detectedScaleFactor: geom.detectedScaleFactor,
+        titleBlockMeta: geom.titleBlockMeta,
+        truncated: geom.truncated,
+        droppedSegmentCount: geom.droppedSegmentCount,
+      };
+    } finally {
+      page.cleanup();
+    }
+  } finally {
+    await loadingTask.destroy();
+  }
+}
 
 async function loadShellPdfPayload(): Promise<PdfExtractionPayload> {
   const pdfPath = path.resolve(process.cwd(), 'public/assets/aistudio/Shell_b55006b8.pdf');
   const bytes = new Uint8Array(await fs.readFile(pdfPath));
-  const pdf = await pdfjsLib.getDocument({ data: bytes, verbosity: 0 }).promise;
-  const page = await pdf.getPage(1);
-  const baseViewport = page.getViewport({ scale: 1 });
-  const viewport = page.getViewport({ scale: 1.5 });
-
-  const textContent = await page.getTextContent();
-  const extractedText: string[] = [];
-  const rawNormalizedTextItems: RawNormalizedText[] = [];
-  for (const item of textContent.items) {
-    if ('str' in item && typeof item.str === 'string') {
-      const cleaned = item.str.trim();
-      if (!cleaned) continue;
-      extractedText.push(cleaned);
-      const tx = item.transform?.[4] ?? 0;
-      const ty = item.transform?.[5] ?? 0;
-      const [vx, vy] = viewport.convertToViewportPoint(tx, ty);
-      rawNormalizedTextItems.push({
-        text: cleaned,
-        nx: Math.max(0, Math.min(1, vx / viewport.width)),
-        ny: Math.max(0, Math.min(1, vy / viewport.height)),
-      });
-    }
-  }
-
-  const ops = await page.getOperatorList();
-  const internalSegments = parseOperatorListToSegments(ops, pdfjsLib.OPS, viewport);
-  const geom = buildPayloadGeometry(
-    internalSegments,
-    rawNormalizedTextItems,
-    1,
-    baseViewport.width,
-    baseViewport.height,
-    () => ''
-  );
-
-  return {
-    fileName: 'Shell_b55006b8.pdf',
-    pageCount: pdf.numPages,
-    selectedPage: 1,
-    pageWidthPt: baseViewport.width,
-    pageHeightPt: baseViewport.height,
-    renderedImageDataUrl: '',
-    extractedText,
-    vectorEntityCount: geom.centeredEntities.length,
-    vectorEntities: geom.centeredEntities,
-    vectorBoundingBox: geom.vectorBoundingBox,
-    hasMultipleViews: geom.viewChunks.length > 1,
-    viewChunks: geom.viewChunks,
-    rawNormalizedSegments: geom.rawNormalizedSegments,
-    rawNormalizedTextItems: rawNormalizedTextItems.slice(0, 600),
-    detectedScaleLabel: geom.detectedScaleLabel,
-    detectedScaleFactor: geom.detectedScaleFactor,
-    titleBlockMeta: geom.titleBlockMeta,
-    truncated: geom.truncated,
-    droppedSegmentCount: geom.droppedSegmentCount,
-  };
+  return extractPayloadFromPdfBytes(bytes, 'Shell_b55006b8.pdf', 1);
 }
 
 async function main() {
@@ -140,9 +172,29 @@ async function main() {
   const dxfOut = exportToDxf(realAnalysis);
   const svgOut = exportToSvg(realAnalysis);
   assert.ok(dxfOut.includes('ENTITIES') && dxfOut.includes('\nDIMENSION\n'));
+  assert.ok(dxfOut.includes('\nCIRCLE\n') && dxfOut.includes('\nARC\n'), 'Expected true CIRCLE and ARC records in DXF');
   assert.ok(svgOut.includes('<svg') && svgOut.includes('data-layer="DIMENSION"') && svgOut.includes('#b45309'));
+  assert.ok(svgOut.includes('<circle') && svgOut.includes('<path'), 'Expected <circle and arc <path in SVG');
   assert.ok(exportToGcode(realAnalysis).includes('M30'));
   assert.ok(exportToProcessCsv(realAnalysis, 25).includes('OP-10'));
+
+  // Step 7 check on Shell_b55006b8.pdf: cross-section view yields recovered circles within 1 mm of 440 and 430
+  const crossSectionChunk = realAnalysis.viewChunks?.find((c) => c.viewKind === 'cross-section');
+  assert.ok(crossSectionChunk, 'Expected a cross-section view chunk on Shell_b55006b8.pdf');
+  const crossOutlineCircles = realAnalysis.entities.filter(
+    (e): e is CadCircleEntity =>
+      e.type === 'circle' && e.viewId === crossSectionChunk.id && e.layer === 'outline'
+  );
+  assert.ok(
+    crossOutlineCircles.every((c) => c.source === 'recovered'),
+    'Expected recovered source flag on cross-section circles'
+  );
+  const crossDias = crossOutlineCircles.map((c) => c.r * 2).sort((a, b) => b - a);
+  assert.ok(
+    crossDias.some((d) => Math.abs(d - 440) <= 1.0) &&
+      crossDias.some((d) => Math.abs(d - 430) <= 1.0),
+    `Expected cross-section circles within 1 mm of 440 and 430, got diameters [${crossDias.map((d) => d.toFixed(2)).join(', ')}]`
+  );
 
   // 2b. Color-agnostic arrowhead + dim text + dim line + extension line detection & CAM exclusion
   const pageW = 842;
@@ -384,12 +436,12 @@ async function main() {
     };
   }
   const t0 = performance.now();
-  const randViews = detectViewRegions(randSegs50k, [], 0.86);
+  const randViews = detectViewRegions(randSegs50k, [], 0.86, inferSheetSizeMm(randSegs50k));
   const clusterMs = performance.now() - t0;
   assert.ok(randViews.length >= 1 && randViews.length <= 6);
   assert.ok(clusterMs < 300, `Expected 50k segment clustering < 300 ms, took ${clusterMs.toFixed(1)} ms`);
 
-  // Synthetic non-square sheet (500 x 200 mm): 3 large views out-of-order + 4 tiny top notes (>6 clusters total)
+  // Synthetic non-square sheet (500 x 200 mm): 3 large views out-of-order + 5 tiny top notes (>6 clusters total)
   const makeBoxSegs = (
     x1: number,
     y1: number,
@@ -403,35 +455,513 @@ async function main() {
     { nx1: x2, ny1: y2, nx2: x1, ny2: y2, x1Mm: x2 * wMm, y1Mm: (1 - y2) * hMm, x2Mm: x1 * wMm, y2Mm: (1 - y2) * hMm, layerHint: 'outline' },
     { nx1: x1, ny1: y2, nx2: x1, ny2: y1, x1Mm: x1 * wMm, y1Mm: (1 - y2) * hMm, x2Mm: x1 * wMm, y2Mm: (1 - y1) * hMm, layerHint: 'outline' },
   ];
-  // Top-right view [0.55..0.85, 0.12..0.38], Top-left view [0.10..0.40, 0.12..0.38], Bottom view [0.15..0.75, 0.55..0.78]
-  // Notice gap between Top-left and Top-right is 0.15 (75 mm > 8 mm). Add 5 tiny noise boxes at top strip.
   const multiViewSegs: RawNormalizedSegment[] = [
-    ...makeBoxSegs(0.15, 0.55, 0.75, 0.78, 500, 200), // Bottom large view inserted first
-    ...makeBoxSegs(0.55, 0.12, 0.85, 0.38, 500, 200), // Top-right view inserted second
-    ...makeBoxSegs(0.10, 0.12, 0.40, 0.38, 500, 200), // Top-left view inserted third
-    // 5 tiny (> 0.04 span, smaller area than main views) noise/callout boxes near top strip
+    ...makeBoxSegs(0.15, 0.55, 0.75, 0.78, 500, 200),
+    ...makeBoxSegs(0.55, 0.12, 0.85, 0.38, 500, 200),
+    ...makeBoxSegs(0.10, 0.12, 0.40, 0.38, 500, 200),
     ...makeBoxSegs(0.05, 0.03, 0.095, 0.06, 500, 200),
     ...makeBoxSegs(0.20, 0.03, 0.245, 0.06, 500, 200),
     ...makeBoxSegs(0.38, 0.03, 0.425, 0.06, 500, 200),
     ...makeBoxSegs(0.60, 0.03, 0.645, 0.06, 500, 200),
     ...makeBoxSegs(0.80, 0.03, 0.845, 0.06, 500, 200),
   ];
-  const multiViews = detectViewRegions(multiViewSegs, [], 0.88);
+  const multiViews = detectViewRegions(multiViewSegs, [], 0.88, { width: 500, height: 200 });
   assert.equal(multiViews.length, 6, 'Expected top 6 views by area when 8 clusters exist');
-  // The 3 largest views must ALL be kept and appear after/in reading order (two top views left->right, then bottom view last)
   const largeViews = multiViews.filter((v) => v.normBounds.w >= 0.3);
   assert.equal(largeViews.length, 3, 'Expected all 3 large views preserved despite 5 smaller top clusters');
   assert.ok(largeViews[0].normBounds.x < largeViews[1].normBounds.x, 'Expected top band left-to-right reading order');
   assert.ok(largeViews[2].normBounds.y > largeViews[0].normBounds.y + 0.2, 'Expected bottom view sorted after top band');
 
-  // Pure 3-view check + isotropic 8 mm check: two views separated horizontally by 11 mm on 500 mm wide sheet (dx=0.022 < old 0.026, > 8/500=0.016) must stay separate!
+  // Isotropic 8 mm check: two views separated horizontally by 11 mm on 500 mm wide sheet stay separate
   const isoSegs: RawNormalizedSegment[] = [
     ...makeBoxSegs(0.10, 0.15, 0.30, 0.35, 500, 200),
-    ...makeBoxSegs(0.322, 0.15, 0.52, 0.35, 500, 200), // 11 mm gap in X from view 1
+    ...makeBoxSegs(0.322, 0.15, 0.52, 0.35, 500, 200),
     ...makeBoxSegs(0.10, 0.52, 0.52, 0.72, 500, 200),
   ];
-  const isoViews = detectViewRegions(isoSegs, [], 0.88);
+  const isoViews = detectViewRegions(isoSegs, [], 0.88, inferSheetSizeMm(isoSegs));
   assert.equal(isoViews.length, 3, `Expected 3 separate views with 11 mm X gap on 500 mm wide sheet, got ${isoViews.length}`);
+
+  // 2g. L-shaped view enclosing a separate 15%-of-sheet-wide view inside its bbox must stay 2 views
+  const mkSeg = (x1: number, y1: number, x2: number, y2: number, wMm: number, hMm: number): RawNormalizedSegment => ({
+    nx1: x1,
+    ny1: y1,
+    nx2: x2,
+    ny2: y2,
+    x1Mm: x1 * wMm,
+    y1Mm: (1 - y1) * hMm,
+    x2Mm: x2 * wMm,
+    y2Mm: (1 - y2) * hMm,
+    layerHint: 'outline',
+  });
+  // L-shape outer bbox [0.10..0.70] x [0.10..0.70] (area 0.36); separate 15%x15% view at [0.42..0.57, 0.18..0.33] (area 0.0225 = 6.25% >= 3%)
+  const lShapeSegs: RawNormalizedSegment[] = [
+    mkSeg(0.10, 0.10, 0.22, 0.10, 420, 297),
+    mkSeg(0.22, 0.10, 0.22, 0.55, 420, 297),
+    mkSeg(0.22, 0.55, 0.70, 0.55, 420, 297),
+    mkSeg(0.70, 0.55, 0.70, 0.70, 420, 297),
+    mkSeg(0.70, 0.70, 0.10, 0.70, 420, 297),
+    mkSeg(0.10, 0.70, 0.10, 0.10, 420, 297),
+    ...makeBoxSegs(0.42, 0.18, 0.57, 0.33, 420, 297),
+  ];
+  const lShapeViews = detectViewRegions(lShapeSegs, [], 0.86, { width: 420, height: 297 });
+  assert.equal(lShapeViews.length, 2, `Expected L-shaped view + nested 15%-wide view to stay 2 views, got ${lShapeViews.length}`);
+
+  // 2h. Long diagonal line spanning across sheet + two distant small views must not merge views
+  const diagTestSegs: RawNormalizedSegment[] = [
+    mkSeg(0.08, 0.72, 0.88, 0.08, 420, 297), // Long diagonal line (1 seg, not crossing corners)
+    ...makeBoxSegs(0.08, 0.08, 0.22, 0.22, 420, 297), // Distant top-left view
+    ...makeBoxSegs(0.74, 0.58, 0.88, 0.72, 420, 297), // Distant bottom-right view
+  ];
+  const diagViews = detectViewRegions(diagTestSegs, [], 0.86, { width: 420, height: 297 });
+  assert.equal(diagViews.length, 2, `Expected long diagonal not to bridge 2 distant views, got ${diagViews.length}`);
+
+  // 2i. 4 dense blobs + 1000 scattered tiny (<0.5 mm) noise segments must still yield 4 views
+  const blobCenters: Array<[number, number]> = [
+    [0.72, 0.20], // top-right (intentionally unordered)
+    [0.22, 0.24], // top-left (same row band as top-right)
+    [0.70, 0.62], // bottom-right
+    [0.24, 0.58], // bottom-left
+  ];
+  const fourBlobSegs: RawNormalizedSegment[] = [];
+  for (const [bx, by] of blobCenters) {
+    fourBlobSegs.push(...makeBoxSegs(bx - 0.08, by - 0.08, bx + 0.08, by + 0.08, 420, 297));
+    // Add dense interior lines >= 1 mm
+    for (let k = 0; k < 20; k++) {
+      const lx = bx - 0.06 + (k % 5) * 0.025;
+      const ly = by - 0.05 + Math.floor(k / 5) * 0.025;
+      fourBlobSegs.push(mkSeg(lx, ly, lx + 0.018, ly + 0.005, 420, 297));
+    }
+  }
+  // 1000 tiny 0.25 mm segments scattered across entire sheet including gaps between blobs
+  for (let i = 0; i < 1000; i++) {
+    const sx = 0.06 + nextRand() * 0.84;
+    const sy = 0.06 + nextRand() * 0.70;
+    const dxNorm = 0.25 / 420; // 0.25 mm < MIN_CLUSTER_BRIDGE_MM (0.5 mm)
+    fourBlobSegs.push(mkSeg(sx, sy, sx + dxNorm, sy, 420, 297));
+  }
+  const blobViews = detectViewRegions(fourBlobSegs, [], 0.86, { width: 420, height: 297 });
+  assert.equal(blobViews.length, 4, `Expected 4 blobs + 1000 tiny noise segs to yield 4 views, got ${blobViews.length}`);
+  assert.ok(blobViews[0].normBounds.x < blobViews[1].normBounds.x, 'Expected row-banded left-to-right order in top band');
+  assert.ok(blobViews[2].normBounds.x < blobViews[3].normBounds.x, 'Expected row-banded left-to-right order in bottom band');
+
+  // 2j. Step 5 stack-safe spreads, length-weighted primaryOutlineWidth mode, crosshair centerline, fill-only & parallel-offset black dimensions
+  const step5Ops = {
+    fnArray: [
+      OPS.setStrokeRGBColor,
+      OPS.setLineWidth,
+      OPS.constructPath, // 4-seg main rectangle part [150,200..450,350] at 0.6 pt (long total length)
+      OPS.setLineWidth,
+      OPS.constructPath, // Single outlier thick 2.5 pt black cutting-plane mark (short 20pt) -> must NOT dominate primaryOutlineWidth
+      OPS.setLineWidth,
+      OPS.constructPath, // Short thin 0.5 pt 45-deg tilted chamfer (15pt) -> must stay 'outline' (not centerline)
+      OPS.constructPath, // Horizontal crosshair seg (20pt, 0.5pt) at (300, 275)
+      OPS.constructPath, // Vertical crosshair seg (20pt, 0.5pt) at (300, 275) -> forms '+' crosshair -> 'centerline'
+      OPS.setLineWidth,
+      OPS.constructPath, // Pure-black 0.4 pt dim line above top edge [150, 390 -> 450, 390]
+      OPS.constructPath, // Fill-only black left arrowhead (tip at 150,390) -> must emit 0 segs yet promote dim line!
+      OPS.constructPath, // Fill-only black right arrowhead (tip at 450,390) -> must emit 0 segs yet promote dim line!
+      OPS.constructPath, // Pure-black 0.4 pt left witness [150, 353 -> 150, 396]
+      OPS.constructPath, // Pure-black 0.4 pt right witness [450, 353 -> 450, 396]
+      OPS.constructPath, // Pure-black arrowheadless thin dim line below bottom edge [150, 165 -> 450, 165] (parallel offset ~12.3 mm)
+    ],
+    argsArray: [
+      ['#000000'],
+      [0.6],
+      [OPS.stroke, [new Float32Array([0, 150, 200, 1, 450, 200, 1, 450, 350, 1, 150, 350, 4])]],
+      [2.5],
+      [OPS.stroke, [new Float32Array([0, 110, 220, 1, 130, 220])]],
+      [0.5],
+      [OPS.stroke, [new Float32Array([0, 160, 210, 1, 175, 225])]],
+      [OPS.stroke, [new Float32Array([0, 290, 275, 1, 310, 275])]],
+      [OPS.stroke, [new Float32Array([0, 300, 265, 1, 300, 285])]],
+      [0.4],
+      [OPS.stroke, [new Float32Array([0, 150, 390, 1, 450, 390])]],
+      [OPS.fill, [new Float32Array([0, 150, 390, 1, 160, 392, 1, 160, 388, 4])]],
+      [OPS.fill, [new Float32Array([0, 450, 390, 1, 440, 392, 1, 440, 388, 4])]],
+      [OPS.stroke, [new Float32Array([0, 150, 353, 1, 150, 396])]],
+      [OPS.stroke, [new Float32Array([0, 450, 353, 1, 450, 396])]],
+      [OPS.stroke, [new Float32Array([0, 150, 165, 1, 450, 165])]],
+    ],
+  };
+  const step5Segs = parseOperatorListToSegments(step5Ops, OPS, mockViewport);
+  assert.equal(step5Segs.length, 12, `Expected 12 stroked segs (2 fill-only arrows excluded from output), got ${step5Segs.length}`);
+  const step5Geom = buildPayloadGeometry(
+    step5Segs,
+    [
+      { text: '300', nx: 300 / pageW, ny: (pageH - 394) / pageH },
+      { text: '300', nx: 300 / pageW, ny: (pageH - 161) / pageH },
+    ],
+    1,
+    pageW,
+    pageH,
+    () => ''
+  );
+  const s5Outlines = step5Geom.centeredEntities.filter((e) => e.layer === 'outline');
+  const s5Centerlines = step5Geom.centeredEntities.filter((e) => e.layer === 'centerline');
+  const s5Dims = step5Geom.centeredEntities.filter((e) => e.layer === 'dimension');
+  assert.equal(s5Outlines.length, 6, `Expected 4 rect + 1 thick mark + 1 tilted chamfer = 6 outline segs, got ${s5Outlines.length}`);
+  assert.equal(s5Centerlines.length, 2, `Expected 2 axis-aligned crosshair segs on centerline, got ${s5Centerlines.length}`);
+  assert.equal(s5Dims.length, 4, `Expected 4 black dim+witness segs promoted, got ${s5Dims.length}`);
+
+  // 2k. Step 6 page rotations (/Rotate 0/90/180/270), non-zero MediaBox, ±/+/-/x callout splitting & structural title block
+  const buildTestPdf = (opts: {
+    mediaBox: [number, number, number, number];
+    rotate: 0 | 90 | 180 | 270;
+    stream: string;
+  }): Uint8Array => {
+    const [mx0, my0, mx1, my1] = opts.mediaBox;
+    const objects = [
+      '1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n',
+      '2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n',
+      `3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [${mx0} ${my0} ${mx1} ${my1}] /Rotate ${opts.rotate} /Contents 4 0 R >>\nendobj\n`,
+      `4 0 obj\n<< /Length ${Buffer.byteLength(opts.stream, 'ascii')} >>\nstream\n${opts.stream}\nendstream\nendobj\n`,
+    ];
+    let pdfText = '%PDF-1.4\n';
+    const offsets: number[] = [0];
+    for (const obj of objects) {
+      offsets.push(Buffer.byteLength(pdfText, 'ascii'));
+      pdfText += obj;
+    }
+    const xrefPos = Buffer.byteLength(pdfText, 'ascii');
+    pdfText += `xref\n0 ${objects.length + 1}\n0000000000 65535 f \n`;
+    for (let i = 1; i <= objects.length; i++) {
+      pdfText += `${String(offsets[i]).padStart(10, '0')} 00000 n \n`;
+    }
+    pdfText += `trailer\n<< /Size ${objects.length + 1} /Root 1 0 R >>\nstartxref\n${xrefPos}\n%%EOF\n`;
+    return Uint8Array.from(Buffer.from(pdfText, 'ascii'));
+  };
+
+  // Non-zero MediaBox [100, 50, 712, 550] (612 x 500 pt) with an asymmetric 300 x 120 pt box at local (80, 100) -> (380, 220)
+  const testMediaBox: [number, number, number, number] = [100, 50, 712, 550];
+  const rectStream = 'q 1.2 w 0 0 0 RG 180 150 300 120 re S Q\n';
+  for (const rot of [0, 90, 180, 270] as const) {
+    const loadingTask = pdfjsLib.getDocument({
+      data: buildTestPdf({ mediaBox: testMediaBox, rotate: rot, stream: rectStream }),
+      verbosity: 0,
+    });
+    const pdfDoc = await loadingTask.promise;
+    try {
+      const page = await pdfDoc.getPage(1);
+      const baseVp = page.getViewport({ scale: 1 });
+      const vp = page.getViewport({ scale: 1.5 });
+      const rotOps = await page.getOperatorList();
+      const rotSegs = parseOperatorListToSegments(rotOps, pdfjsLib.OPS, vp);
+      assert.equal(rotSegs.length, 4, `Rotate ${rot}: expected 4 rect segments, got ${rotSegs.length}`);
+
+      const pageWmm = baseVp.width * PT_TO_MM;
+      const pageHmm = baseVp.height * PT_TO_MM;
+      for (const s of rotSegs) {
+        // Every endpoint must satisfy xMm/pageWmm == nx and yMm/pageHmm == 1 - ny in the rotated/MediaBox frame
+        assert.ok(
+          Math.abs(s.x1Mm / pageWmm - s.nx1) < 0.002 &&
+            Math.abs(s.y1Mm / pageHmm - (1 - s.ny1)) < 0.002,
+          `Rotate ${rot}: normalized and mm frames disagree (${s.x1Mm}/${pageWmm} vs ${s.nx1})`
+        );
+      }
+
+      const rotGeom = buildPayloadGeometry(rotSegs, [], 1, baseVp.width, baseVp.height, () => '');
+      const spanX = rotGeom.vectorBoundingBox.maxX - rotGeom.vectorBoundingBox.minX;
+      const spanY = rotGeom.vectorBoundingBox.maxY - rotGeom.vectorBoundingBox.minY;
+      const expectedW = (rot === 90 || rot === 270 ? 120 : 300) * PT_TO_MM;
+      const expectedH = (rot === 90 || rot === 270 ? 300 : 120) * PT_TO_MM;
+      assert.ok(
+        Math.abs(spanX - expectedW) < 0.2 && Math.abs(spanY - expectedH) < 0.2,
+        `Rotate ${rot}: expected visual bbox ${expectedW.toFixed(1)}x${expectedH.toFixed(1)} mm, got ${spanX.toFixed(1)}x${spanY.toFixed(1)} mm`
+      );
+    } finally {
+      await loadingTask.destroy();
+    }
+  }
+
+  // Callout splitting (±, +/-, x, X) & tolerance-only token exclusion in scale calibration
+  const splitVals = extractNumericDimCallouts(['25±0.1', '40+/-0.2', '4x120', '100 X 50', '1:20']);
+  assert.deepEqual(splitVals, [120, 100, 50, 40, 25, 4, 0.2, 0.1]);
+  const nominalOnly = extractNumericDimCallouts(['25±0.1', '±200', '+/-150', '40+/-0.2'], {
+    excludeTolerances: true,
+  });
+  assert.deepEqual(nominalOnly, [40, 25]);
+
+  const tolScaleResult = calibrateScaleFromViewChunks(
+    [
+      {
+        id: 'view-1',
+        label: 'Front',
+        viewKind: 'orthogonal',
+        pageNumber: 1,
+        normBounds: { x: 0.1, y: 0.1, w: 0.3, h: 0.2 },
+        croppedImageDataUrl: '',
+        extractedText: ['200±0.1', '±999'],
+        vectorEntities: [],
+        boundingBox: { minX: -5, minY: -2.5, maxX: 5, maxY: 2.5 },
+        sheetOffset: { dx: 0, dy: 0 },
+      },
+      {
+        id: 'view-2',
+        label: 'Side',
+        viewKind: 'orthogonal',
+        pageNumber: 1,
+        normBounds: { x: 0.5, y: 0.1, w: 0.3, h: 0.2 },
+        croppedImageDataUrl: '',
+        extractedText: ['200+/-0.2', '+/-888'],
+        vectorEntities: [],
+        boundingBox: { minX: -5, minY: -2.5, maxX: 5, maxY: 2.5 },
+        sheetOffset: { dx: 0, dy: 0 },
+      },
+    ],
+    { units: 'mm' }
+  );
+  assert.equal(tolScaleResult.scaleFactor, 20, 'Expected tolerances ignored and nominals calibrating 1:20');
+
+  // Structural title-block label exclusion with an arbitrary company name (no hardcoded company filter)
+  const metaArbitrary = parseTitleBlockMetadata(
+    [
+      { text: 'Apex Precision Industries', nx: 0.57, ny: 0.82 },
+      { text: 'TITLE:', nx: 0.565, ny: 0.848 },
+      { text: 'FINISH:', nx: 0.59, ny: 0.848 },
+      { text: 'Drive Flange', nx: 0.58, ny: 0.872 },
+      { text: 'DWG NO.', nx: 0.565, ny: 0.918 },
+      { text: 'DF-402', nx: 0.65, ny: 0.92 },
+      { text: 'REV', nx: 0.80, ny: 0.795 },
+      { text: 'C', nx: 0.86, ny: 0.795 },
+      { text: 'MATERIAL:', nx: 0.372, ny: 0.918 },
+      { text: '6061-T6', nx: 0.43, ny: 0.92 },
+      { text: 'WEIGHT:', nx: 0.372, ny: 0.962 },
+      { text: '12.5 Kg', nx: 0.43, ny: 0.963 },
+    ],
+    []
+  );
+  assert.equal(metaArbitrary.partName, 'Drive Flange');
+  assert.equal(metaArbitrary.partNumber, 'DF-402');
+  assert.equal(metaArbitrary.revision, 'C');
+  assert.equal(metaArbitrary.material, '6061-T6');
+  assert.equal(metaArbitrary.weight, '12.5 Kg');
+
+  // 2l. Step 7 primitive recovery: 4-Bezier circle, CCW/CW arcs, collinear polyline, straight lines, ellipse rejection & scaling
+  const kKappa = 0.5522847498;
+  const cxPt = 300;
+  const cyPt = 260;
+  const rPt = 50;
+  const kr = kKappa * rPt;
+  const bezCircleOps = {
+    fnArray: [OPS.setStrokeRGBColor, OPS.setLineWidth, OPS.constructPath],
+    argsArray: [
+      ['#000000'],
+      [1.0],
+      [
+        OPS.stroke,
+        [
+          new Float32Array([
+            0, cxPt + rPt, cyPt,
+            2, cxPt + rPt, cyPt + kr, cxPt + kr, cyPt + rPt, cxPt, cyPt + rPt,
+            2, cxPt - kr, cyPt + rPt, cxPt - rPt, cyPt + kr, cxPt - rPt, cyPt,
+            2, cxPt - rPt, cyPt - kr, cxPt - kr, cyPt - rPt, cxPt, cyPt - rPt,
+            2, cxPt + kr, cyPt - rPt, cxPt + rPt, cyPt - kr, cxPt + rPt, cyPt,
+            4,
+          ]),
+        ],
+      ],
+    ],
+  };
+  const bezSegs = parseOperatorListToSegments(bezCircleOps, OPS, mockViewport).map((s) => ({
+    nx1: s.nx1,
+    ny1: s.ny1,
+    nx2: s.nx2,
+    ny2: s.ny2,
+    x1Mm: s.x1Mm,
+    y1Mm: s.y1Mm,
+    x2Mm: s.x2Mm,
+    y2Mm: s.y2Mm,
+    layerHint: 'outline' as const,
+    strokeStyleKey: '1.00:0.00:0',
+    subpathId: s.subpathId,
+  }));
+  const bezPrims = recoverPrimitivesFromSegments(bezSegs);
+  assert.equal(bezPrims.length, 1, `Expected 4-Bezier circle -> 1 CadCircleEntity, got ${bezPrims.length}`);
+  assert.equal(bezPrims[0].type, 'circle');
+  assert.equal(bezPrims[0].source, 'recovered');
+  const bezCircle = bezPrims[0] as CadCircleEntity;
+  assert.ok(
+    Math.abs(bezCircle.r - rPt * PT_TO_MM) < 0.05 &&
+      Math.abs(bezCircle.cx - cxPt * PT_TO_MM) < 0.05 &&
+      Math.abs(bezCircle.cy - cyPt * PT_TO_MM) < 0.05,
+    `Expected Bezier circle r=${(rPt * PT_TO_MM).toFixed(2)}, got r=${bezCircle.r}`
+  );
+
+  // Arc recovery (CCW 30->150 deg and CW 240->120 deg -> CCW 120->240 deg), collinear run -> polyline, standalone -> line
+  const arcChain = (startDeg: number, endDeg: number, steps: number, sid: number): RawNormalizedSegment[] => {
+    const out: RawNormalizedSegment[] = [];
+    const rr = 25;
+    for (let k = 0; k < steps; k++) {
+      const a0 = ((startDeg + ((endDeg - startDeg) * k) / steps) * Math.PI) / 180;
+      const a1 = ((startDeg + ((endDeg - startDeg) * (k + 1)) / steps) * Math.PI) / 180;
+      const x1Mm = 60 + rr * Math.cos(a0);
+      const y1Mm = 60 + rr * Math.sin(a0);
+      const x2Mm = 60 + rr * Math.cos(a1);
+      const y2Mm = 60 + rr * Math.sin(a1);
+      out.push({
+        nx1: x1Mm / 297,
+        ny1: 1 - y1Mm / 210,
+        nx2: x2Mm / 297,
+        ny2: 1 - y2Mm / 210,
+        x1Mm,
+        y1Mm,
+        x2Mm,
+        y2Mm,
+        layerHint: 'outline',
+        strokeStyleKey: '1.00:0.00:0',
+        subpathId: sid,
+      });
+    }
+    return out;
+  };
+  const cwArcSegs = arcChain(240, 120, 6, 101);
+  const collinearRun: RawNormalizedSegment[] = [
+    { nx1: 0.1, ny1: 0.5, nx2: 0.2, ny2: 0.5, x1Mm: 10, y1Mm: 10, x2Mm: 20, y2Mm: 10, layerHint: 'outline', strokeStyleKey: '1.00:0.00:0', subpathId: 102 },
+    { nx1: 0.2, ny1: 0.5, nx2: 0.3, ny2: 0.5, x1Mm: 20, y1Mm: 10, x2Mm: 30, y2Mm: 10, layerHint: 'outline', strokeStyleKey: '1.00:0.00:0', subpathId: 102 },
+    { nx1: 0.3, ny1: 0.5, nx2: 0.4, ny2: 0.5, x1Mm: 30, y1Mm: 10, x2Mm: 40, y2Mm: 10, layerHint: 'outline', strokeStyleKey: '1.00:0.00:0', subpathId: 102 },
+  ];
+  const singleLine: RawNormalizedSegment = {
+    nx1: 0.5, ny1: 0.2, nx2: 0.7, ny2: 0.2, x1Mm: 50, y1Mm: 20, x2Mm: 70, y2Mm: 20, layerHint: 'outline', strokeStyleKey: '1.00:0.00:0', subpathId: 103,
+  };
+  const ellipseSegs: RawNormalizedSegment[] = [];
+  for (let k = 0; k < 24; k++) {
+    const a0 = (k / 24) * Math.PI * 2;
+    const a1 = ((k + 1) / 24) * Math.PI * 2;
+    const x1Mm = 120 + 30 * Math.cos(a0);
+    const y1Mm = 80 + 15 * Math.sin(a0);
+    const x2Mm = 120 + 30 * Math.cos(a1);
+    const y2Mm = 80 + 15 * Math.sin(a1);
+    ellipseSegs.push({
+      nx1: x1Mm / 297,
+      ny1: 1 - y1Mm / 210,
+      nx2: x2Mm / 297,
+      ny2: 1 - y2Mm / 210,
+      x1Mm,
+      y1Mm,
+      x2Mm,
+      y2Mm,
+      layerHint: 'outline',
+      strokeStyleKey: '1.00:0.00:0',
+      subpathId: 104,
+    });
+  }
+  const mixedPrims = recoverPrimitivesFromSegments([
+    ...cwArcSegs,
+    ...collinearRun,
+    singleLine,
+  ]);
+  const ellipsePrims = recoverPrimitivesFromSegments(ellipseSegs);
+  assert.equal(
+    ellipsePrims.filter((e) => e.type === 'circle').length,
+    0,
+    'Expected 2:1 ellipse rejected from circle recovery'
+  );
+  const recArcs = mixedPrims.filter((e): e is CadArcEntity => e.type === 'arc');
+  const recPolys = mixedPrims.filter((e): e is CadPolylineEntity => e.type === 'polyline');
+  const recLines = mixedPrims.filter((e): e is CadLineEntity => e.type === 'line');
+  const recCircles = mixedPrims.filter((e): e is CadCircleEntity => e.type === 'circle');
+  assert.equal(recCircles.length, 0);
+  assert.equal(recArcs.length, 1, `Expected CW chord arc recovered as 1 CCW CadArcEntity, got ${recArcs.length}`);
+  assert.equal(recArcs[0].source, 'recovered');
+  assert.ok(
+    Math.abs(recArcs[0].r - 25) < 0.05 &&
+      Math.abs(recArcs[0].startAngle - 120) < 0.5 &&
+      Math.abs(recArcs[0].endAngle - 240) < 0.5,
+    `Expected CCW arc angles 120..240 r=25, got ${recArcs[0].startAngle}..${recArcs[0].endAngle} r=${recArcs[0].r}`
+  );
+  assert.equal(recPolys.length, 1, 'Expected collinear chain merged into 1 CadPolylineEntity');
+  assert.equal(recPolys[0].source, 'recovered');
+  assert.deepEqual(recPolys[0].points, [{ x: 10, y: 10 }, { x: 40, y: 10 }]);
+  assert.equal(recLines.length, 1);
+  assert.ok(recLines[0].x1 === 50 && recLines[0].x2 === 70 && recLines[0].source === 'vector', 'Expected standalone line kept with source=vector');
+
+  // Verify buildRawVectorAnalysis scales recovered primitives cleanly and DXF exports CIRCLE/ARC
+  const synthScaledAnalysis = buildRawVectorAnalysis(
+    {
+      fileName: 'synth-prim.pdf',
+      pageCount: 1,
+      selectedPage: 1,
+      pageWidthPt: 297 / PT_TO_MM,
+      pageHeightPt: 210 / PT_TO_MM,
+      renderedImageDataUrl: '',
+      extractedText: ['SCALE 1:5'],
+      vectorEntityCount: mixedPrims.length,
+      vectorEntities: [bezCircle, recArcs[0]],
+      vectorBoundingBox: { minX: -50, minY: -50, maxX: 120, maxY: 120 },
+      hasMultipleViews: false,
+      viewChunks: [],
+      rawNormalizedSegments: [],
+      rawNormalizedTextItems: [],
+      detectedScaleLabel: '1:5',
+      detectedScaleFactor: 5,
+      truncated: false,
+      droppedSegmentCount: 0,
+    },
+    { scaleMode: 'real' }
+  );
+  const scaledCircle = synthScaledAnalysis.entities.find((e): e is CadCircleEntity => e.type === 'circle');
+  const scaledArc = synthScaledAnalysis.entities.find((e): e is CadArcEntity => e.type === 'arc');
+  assert.ok(scaledCircle && Math.abs(scaledCircle.r - bezCircle.r * 5) < 0.1 && scaledCircle.source === 'recovered');
+  assert.ok(scaledArc && Math.abs(scaledArc.r - 125) < 0.2 && scaledArc.source === 'recovered');
+  const synthDxf = exportToDxf(synthScaledAnalysis);
+  assert.ok(synthDxf.includes('\nCIRCLE\n') && synthDxf.includes('\nARC\n'));
+
+  // 2m. Step 8 regression suite: 4 generated mechanical sample PDFs vs preset vector count, view count & bounding boxes
+  const generatedPresets = SAMPLE_DRAWINGS.filter((p) => !p.assetUrl);
+  assert.equal(generatedPresets.length, 4, `Expected 4 generated sample presets, got ${generatedPresets.length}`);
+  const sampleSummaries: string[] = [];
+  for (const preset of generatedPresets) {
+    const sampleBuf = generateSampleMechanicalPdfBytes(preset);
+    const samplePayload = await extractPayloadFromPdfBytes(new Uint8Array(sampleBuf), preset.fileName, 1);
+    const expectedViews = preset.analysis.viewChunks?.length ?? 1;
+    assert.equal(samplePayload.truncated, false, `${preset.id}: unexpected truncation`);
+    assert.equal(
+      samplePayload.vectorEntityCount,
+      samplePayload.vectorEntities.length,
+      `${preset.id}: vectorEntityCount mismatch`
+    );
+    assert.ok(
+      samplePayload.vectorEntityCount >= preset.analysis.entities.length,
+      `${preset.id}: expected >=${preset.analysis.entities.length} vectors, got ${samplePayload.vectorEntityCount}`
+    );
+    assert.equal(
+      samplePayload.viewChunks.length,
+      expectedViews,
+      `${preset.id}: expected ${expectedViews} views, got ${samplePayload.viewChunks.length}`
+    );
+
+    const sampleAnalysis = buildRawVectorAnalysis(samplePayload, 'real');
+    const aSpanX = sampleAnalysis.boundingBox.maxX - sampleAnalysis.boundingBox.minX;
+    const aSpanY = sampleAnalysis.boundingBox.maxY - sampleAnalysis.boundingBox.minY;
+    const presetBB = preset.analysis.boundingBox;
+    const pSpanX = presetBB.maxX - presetBB.minX;
+    const pSpanY = presetBB.maxY - presetBB.minY;
+
+    if (expectedViews === 1) {
+      // Single-view generator fits preset boundingBox using scale = min(360 / spanX, 260 / spanY) pt/unit
+      const genScalePt = Math.min(360 / Math.max(40, pSpanX), 260 / Math.max(40, pSpanY));
+      const expectedPaperX = pSpanX * genScalePt * PT_TO_MM;
+      const expectedPaperY = pSpanY * genScalePt * PT_TO_MM;
+      assert.ok(
+        Math.abs(aSpanX - expectedPaperX) <= 1.0,
+        `${preset.id}: expected spanX ~${expectedPaperX.toFixed(1)} mm, got ${aSpanX.toFixed(1)} mm`
+      );
+      assert.ok(
+        aSpanY >= expectedPaperY * 0.72 && aSpanY <= expectedPaperY * 1.05,
+        `${preset.id}: expected spanY in [${(expectedPaperY * 0.72).toFixed(1)}, ${(expectedPaperY * 1.05).toFixed(1)}] mm, got ${aSpanY.toFixed(1)} mm`
+      );
+    } else {
+      const pRatio = pSpanX / pSpanY;
+      const aRatio = aSpanX / aSpanY;
+      assert.ok(
+        Math.abs(aRatio - pRatio) <= 0.15 && aSpanX > 150 && aSpanY > 100,
+        `${preset.id}: expected multi-view aspect ~${pRatio.toFixed(2)}, got ${aRatio.toFixed(2)} (${aSpanX.toFixed(1)}x${aSpanY.toFixed(1)} mm)`
+      );
+    }
+    sampleSummaries.push(
+      `${preset.id}:${samplePayload.vectorEntityCount}v/${samplePayload.viewChunks.length}vw`
+    );
+  }
 
   // 3. Entity & NaN sanitization guards
   const sanitized = sanitizeAnalysisResult({
@@ -439,15 +969,16 @@ async function main() {
     entities: [
       { id: 'bad-line', layer: 'outline', type: 'line', x1: Number.NaN, y1: 0, x2: 10, y2: 10 },
       { id: 'bad-circle', layer: 'hole', type: 'circle', cx: 0, cy: 0, r: 0 },
-      { id: 'good-circle', layer: 'hole', type: 'circle', cx: 10, cy: -5, r: 6 },
+      { id: 'good-circle', layer: 'hole', type: 'circle', cx: 10, cy: -5, r: 6, source: 'recovered' },
     ],
   });
   assert.equal(sanitized.entities.length, 1);
   assert.equal(sanitized.entities[0].id, 'good-circle');
+  assert.equal(sanitized.entities[0].source, 'recovered');
   assert.ok(Number.isFinite(sanitized.boundingBox.minX) && Number.isFinite(sanitized.boundingBox.maxX));
 
   console.log(
-    `Self-check passed: Shell_b55006b8.pdf (${payload.vectorEntityCount} vectors, ${payload.viewChunks.length} views, real ${realSpanX.toFixed(1)}x${realSpanY.toFixed(1)} mm), Step 1-4 (50k grid cluster ${clusterMs.toFixed(1)} ms), paint/clip/XObject, dim topology, CAM & sanitize guards OK.`
+    `Self-check passed: Shell_b55006b8.pdf (${payload.vectorEntityCount} vectors, ${payload.viewChunks.length} views, circles ${crossDias.map((d) => d.toFixed(1)).join('/')} mm, real ${realSpanX.toFixed(1)}x${realSpanY.toFixed(1)} mm), Step 1-8 (50k grid cluster ${clusterMs.toFixed(1)} ms, rot 0/90/180/270 & MediaBox, Bezier/arc/polyline recovery, 4 sample PDFs [${sampleSummaries.join(', ')}]), CAM & sanitize guards OK.`
   );
 }
 

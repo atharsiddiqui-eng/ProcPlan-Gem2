@@ -82,7 +82,11 @@ export interface PdfOpsTable {
 export interface PdfViewportLike {
   width: number;
   height: number;
-  convertToViewportPoint(x: number, y: number): number[];
+  scale?: number;
+  transform?: number[];
+  viewBox?: number[];
+  rotation?: number;
+  convertToViewportPoint?(x: number, y: number): number[];
 }
 
 export interface VectorAnalysisOptions {
@@ -171,18 +175,24 @@ export function detectTitleBlockTopNy(
 
   if (anchorYs.length === 0) return 0.86;
 
-  const minAnchorY = Math.min(...anchorYs);
-  const wideHorizLines = segments
-    .filter((s) => {
-      const spanX = Math.abs(s.nx2 - s.nx1);
-      const spanY = Math.abs(s.ny2 - s.ny1);
-      const midY = (s.ny1 + s.ny2) / 2;
-      return spanX > 0.48 && spanY < 0.01 && midY >= 0.7 && midY <= minAnchorY + 0.015;
-    })
-    .map((s) => Math.min(s.ny1, s.ny2));
+  let minAnchorY = Infinity;
+  for (let i = 0; i < anchorYs.length; i++) {
+    if (anchorYs[i] < minAnchorY) minAnchorY = anchorYs[i];
+  }
+  let minWideY = Infinity;
+  for (let i = 0; i < segments.length; i++) {
+    const s = segments[i];
+    const spanX = Math.abs(s.nx2 - s.nx1);
+    const spanY = Math.abs(s.ny2 - s.ny1);
+    const midY = (s.ny1 + s.ny2) / 2;
+    if (spanX > 0.48 && spanY < 0.01 && midY >= 0.7 && midY <= minAnchorY + 0.015) {
+      const topY = s.ny1 < s.ny2 ? s.ny1 : s.ny2;
+      if (topY < minWideY) minWideY = topY;
+    }
+  }
 
-  if (wideHorizLines.length > 0) {
-    return Math.max(0.7, Math.min(...wideHorizLines) - 0.004);
+  if (Number.isFinite(minWideY)) {
+    return Math.max(0.7, minWideY - 0.004);
   }
   return Math.max(0.72, Math.min(0.84, minAnchorY - 0.018));
 }
@@ -442,6 +452,103 @@ function isSheetChromeSegment(
   return false;
 }
 
+interface TransientArrowHint {
+  tipNx: number;
+  tipNy: number;
+  tailNx: number;
+  tailNy: number;
+}
+
+const fillOnlyArrowHintsMap = new WeakMap<InternalSegment[], TransientArrowHint[]>();
+
+function detectArrowTipInSmallSubpath(segs: InternalSegment[]): TransientArrowHint | null {
+  if (segs.length < 2 || segs.length > 4) return null;
+  let minX = Infinity;
+  let minY = Infinity;
+  let maxX = -Infinity;
+  let maxY = -Infinity;
+  let maxLen = 0;
+  for (let i = 0; i < segs.length; i++) {
+    const s = segs[i];
+    if (s.x1Mm < minX) minX = s.x1Mm;
+    if (s.x2Mm < minX) minX = s.x2Mm;
+    if (s.y1Mm < minY) minY = s.y1Mm;
+    if (s.y2Mm < minY) minY = s.y2Mm;
+    if (s.x1Mm > maxX) maxX = s.x1Mm;
+    if (s.x2Mm > maxX) maxX = s.x2Mm;
+    if (s.y1Mm > maxY) maxY = s.y1Mm;
+    if (s.y2Mm > maxY) maxY = s.y2Mm;
+    if (s.lenMm > maxLen) maxLen = s.lenMm;
+  }
+  const span = Math.max(maxX - minX, maxY - minY);
+  if (span < 0.65 || span > 6.5 || maxLen > 6.5) return null;
+
+  const pts: Array<{
+    x: number;
+    y: number;
+    nx: number;
+    ny: number;
+    others: Array<{ x: number; y: number; nx: number; ny: number; len: number }>;
+  }> = [];
+  for (const s of segs) {
+    const addEnd = (px: number, py: number, pnx: number, pny: number, ox: number, oy: number, onx: number, ony: number) => {
+      const existing = pts.find((p) => Math.hypot(p.x - px, p.y - py) <= 0.35);
+      if (existing) existing.others.push({ x: ox, y: oy, nx: onx, ny: ony, len: s.lenMm });
+      else pts.push({ x: px, y: py, nx: pnx, ny: pny, others: [{ x: ox, y: oy, nx: onx, ny: ony, len: s.lenMm }] });
+    };
+    addEnd(s.x1Mm, s.y1Mm, s.nx1, s.ny1, s.x2Mm, s.y2Mm, s.nx2, s.ny2);
+    addEnd(s.x2Mm, s.y2Mm, s.nx2, s.ny2, s.x1Mm, s.y1Mm, s.nx1, s.ny1);
+  }
+
+  for (const p of pts) {
+    if (p.others.length !== 2) continue;
+    const [a, b] = p.others;
+    if (a.len < 0.6 || b.len < 0.6) continue;
+    const v1x = (a.x - p.x) / a.len;
+    const v1y = (a.y - p.y) / a.len;
+    const v2x = (b.x - p.x) / b.len;
+    const v2y = (b.y - p.y) / b.len;
+    const cosA = v1x * v2x + v1y * v2y;
+    if (cosA >= 0.53 && cosA <= 0.988) {
+      return {
+        tipNx: p.nx,
+        tipNy: p.ny,
+        tailNx: (a.nx + b.nx) * 0.5,
+        tailNy: (a.ny + b.ny) * 0.5,
+      };
+    }
+  }
+  return null;
+}
+
+function computePrimaryOutlineWidth(segments: InternalSegment[]): number {
+  const weightByWidthBucket = new Map<number, number>();
+  for (let i = 0; i < segments.length; i++) {
+    const s = segments[i];
+    if (
+      s.strokeLuminance >= 0.28 ||
+      s.isDashed ||
+      !Number.isFinite(s.effLineWidth) ||
+      s.effLineWidth <= 0
+    ) {
+      continue;
+    }
+    const bucket = Math.round(s.effLineWidth * 20) / 20;
+    weightByWidthBucket.set(bucket, (weightByWidthBucket.get(bucket) ?? 0) + s.lenMm);
+  }
+  if (weightByWidthBucket.size === 0) return 0.6;
+
+  let bestWidth = 0.6;
+  let bestWeight = -1;
+  for (const [width, totalLen] of weightByWidthBucket.entries()) {
+    if (totalLen > bestWeight || (Math.abs(totalLen - bestWeight) <= 1e-6 && width > bestWidth)) {
+      bestWeight = totalLen;
+      bestWidth = width;
+    }
+  }
+  return bestWidth;
+}
+
 function classifySegmentLayer(seg: InternalSegment, primaryOutlineWidth: number): CadLayer {
   if (seg.isDashed) {
     return seg.dashCount >= 3 || seg.effLineWidth <= primaryOutlineWidth * 0.85
@@ -451,13 +558,7 @@ function classifySegmentLayer(seg: InternalSegment, primaryOutlineWidth: number)
   if (seg.strokeLuminance >= 0.3 && seg.strokeLuminance <= 0.68) {
     return 'dimension';
   }
-  if (
-    seg.pathSegCount === 1 &&
-    seg.effLineWidth <= Math.max(0.5, primaryOutlineWidth * 0.86) &&
-    seg.lenMm <= 14
-  ) {
-    return 'centerline';
-  }
+  // Short thin non-dashed lines are only promoted to centerline when verified as axis-aligned crosshairs or circle centers
   return 'outline';
 }
 
@@ -485,6 +586,45 @@ export function parseOperatorListToSegments(
   let startX = 0;
   let startY = 0;
 
+  const resolveViewportScale = (): number => {
+    if (typeof viewport.scale === 'number' && Number.isFinite(viewport.scale) && viewport.scale > 0) {
+      return viewport.scale;
+    }
+    if (Array.isArray(viewport.transform) && viewport.transform.length >= 4) {
+      const s = Math.hypot(viewport.transform[0], viewport.transform[1]);
+      if (Number.isFinite(s) && s > 0) return s;
+    }
+    if (Array.isArray(viewport.viewBox) && viewport.viewBox.length >= 4 && viewport.width > 0) {
+      const vbW = Math.abs(viewport.viewBox[2] - viewport.viewBox[0]);
+      const vbH = Math.abs(viewport.viewBox[3] - viewport.viewBox[1]);
+      const rot = (((viewport.rotation ?? 0) % 360) + 360) % 360;
+      const unscaledW = rot === 90 || rot === 270 ? vbH : vbW;
+      if (unscaledW > 0) return viewport.width / unscaledW;
+    }
+    return 1;
+  };
+  const vpScale = resolveViewportScale();
+
+  const toViewportPoint = (x: number, y: number): [number, number] => {
+    if (typeof viewport.convertToViewportPoint === 'function') {
+      const pt = viewport.convertToViewportPoint(x, y);
+      return [pt[0], pt[1]];
+    }
+    if (Array.isArray(viewport.transform) && viewport.transform.length >= 6) {
+      const t = viewport.transform;
+      return [t[0] * x + t[2] * y + t[4], t[1] * x + t[3] * y + t[5]];
+    }
+    if (Array.isArray(viewport.viewBox) && viewport.viewBox.length >= 4) {
+      const [vx0, vy0, vx1, vy1] = viewport.viewBox;
+      const rot = (((viewport.rotation ?? 0) % 360) + 360) % 360;
+      if (rot === 90) return [(y - vy0) * vpScale, (x - vx0) * vpScale];
+      if (rot === 180) return [(vx1 - x) * vpScale, (y - vy0) * vpScale];
+      if (rot === 270) return [(vy1 - y) * vpScale, (vx1 - x) * vpScale];
+      return [(x - vx0) * vpScale, (vy1 - y) * vpScale];
+    }
+    return [x * vpScale, viewport.height - y * vpScale];
+  };
+
   const pushSegment = (
     ax: number,
     ay: number,
@@ -510,15 +650,25 @@ export function parseOperatorListToSegments(
     ) {
       return;
     }
-    const x1Mm = p1.x * PT_TO_MM;
-    const y1Mm = p1.y * PT_TO_MM;
-    const x2Mm = p2.x * PT_TO_MM;
-    const y2Mm = p2.y * PT_TO_MM;
+
+    const [vx1, vy1] = toViewportPoint(p1.x, p1.y);
+    const [vx2, vy2] = toViewportPoint(p2.x, p2.y);
+    if (
+      !Number.isFinite(vx1) ||
+      !Number.isFinite(vy1) ||
+      !Number.isFinite(vx2) ||
+      !Number.isFinite(vy2)
+    ) {
+      return;
+    }
+    // Compute mm and normalized coords in the exact same rotated & MediaBox-adjusted viewport frame
+    const x1Mm = (vx1 / vpScale) * PT_TO_MM;
+    const y1Mm = ((viewport.height - vy1) / vpScale) * PT_TO_MM;
+    const x2Mm = (vx2 / vpScale) * PT_TO_MM;
+    const y2Mm = ((viewport.height - vy2) / vpScale) * PT_TO_MM;
     const lenMm = Math.hypot(x2Mm - x1Mm, y2Mm - y1Mm);
     if (!Number.isFinite(lenMm) || lenMm < 0.08) return;
 
-    const [vx1, vy1] = viewport.convertToViewportPoint(p1.x, p1.y);
-    const [vx2, vy2] = viewport.convertToViewportPoint(p2.x, p2.y);
     const ctmScale = Math.hypot(gState.cm[0], gState.cm[1]) || 1;
 
     outList.push({
@@ -685,6 +835,7 @@ export function parseOperatorListToSegments(
 
   let pendingLegacySubpaths: InternalSegment[][] = [];
   let curLegacySegs: InternalSegment[] = [];
+  const transientFillArrows: TransientArrowHint[] = [];
 
   for (let i = 0; i < ops.fnArray.length; i++) {
     const fn = ops.fnArray[i];
@@ -738,18 +889,29 @@ export function parseOperatorListToSegments(
         typeof (args[1][0] as { length?: number }).length === 'number'
       ) {
         const paintOp = args[0];
-        if (!isStrokedPaintOp(paintOp)) {
-          continue; // Ignore clip-only (W n / endPath) and fill-only paths (including fill-only arrowheads)
-        }
+        const isStroked = isStrokedPaintOp(paintOp);
         const isFilled = isFilledPaintOp(paintOp);
+        if (!isStroked && !isFilled) {
+          continue; // Ignore clip-only (W n / endPath) paths
+        }
         let pathSegs: InternalSegment[] = [];
+        const recordPath = (segs: InternalSegment[]) => {
+          if (segs.length === 0) return;
+          if (isStroked) {
+            commitPathSegments(segs, isFilled);
+          } else {
+            // Fill-only paths emit zero segments, but small triangles record transient arrowhead hints for dim-line promotion
+            const hint = detectArrowTipInSmallSubpath(segs);
+            if (hint) transientFillArrows.push(hint);
+          }
+        };
         const arr = args[1][0] as Float32Array | number[];
         let k = 0;
         while (k < arr.length) {
           const sub = arr[k++];
           if (sub === 0) {
             if (pathSegs.length > 0) {
-              commitPathSegments(pathSegs, isFilled);
+              recordPath(pathSegs);
               pathSegs = [];
             }
             curX = arr[k++];
@@ -782,7 +944,7 @@ export function parseOperatorListToSegments(
             break;
           }
         }
-        commitPathSegments(pathSegs, isFilled);
+        recordPath(pathSegs);
       } else if (Array.isArray(args[0]) && Array.isArray(args[1])) {
         // Legacy constructPath(subOps, coords) waits for trailing paint op (stroke / fill / endPath)
         const subOps = args[0] as number[];
@@ -825,9 +987,23 @@ export function parseOperatorListToSegments(
       }
       pendingLegacySubpaths = [];
     } else if (isDiscardPaintOp(fn)) {
+      if (curLegacySegs.length > 0) {
+        pendingLegacySubpaths.push(curLegacySegs);
+        curLegacySegs = [];
+      }
+      if (isFilledPaintOp(fn)) {
+        for (const sub of pendingLegacySubpaths) {
+          const hint = detectArrowTipInSmallSubpath(sub);
+          if (hint) transientFillArrows.push(hint);
+        }
+      }
       pendingLegacySubpaths = [];
       curLegacySegs = [];
     }
+  }
+
+  if (transientFillArrows.length > 0) {
+    fillOnlyArrowHintsMap.set(allInternalSegments, transientFillArrows);
   }
 
   return allInternalSegments;
@@ -859,13 +1035,13 @@ function isDimensionTextToken(text: string): boolean {
   const trimmed = text.trim();
   if (!trimmed || /^\d+(?:\.\d+)?\s*:\s*\d+(?:\.\d+)?$/.test(trimmed)) return false;
   return (
-    /^(?:[ØøRrMm±]?\s*\d{1,5}(?:\.\d+)?(?:\s*[°"'])?|\d+(?:\.\d+)?\s*[x×]\s*\d+(?:\.\d+)?)$/i.test(
+    /^(?:[ØøRrMm±]?\s*\d{1,5}(?:\.\d+)?(?:\s*[°"'])?|\d+(?:\.\d+)?\s*[x×]\s*[ØøRrMm]?\s*\d+(?:\.\d+)?)$/i.test(
       trimmed
-    ) || /(?:[Øø°±]\s*\d|\d\s*[Øø°±])/.test(trimmed)
+    ) || /(?:[Øø°±]\s*\d|\d\s*(?:[Øø°±]|\+\s*\/\s*-))/.test(trimmed)
   );
 }
 
-// shortcut: detects CAD wedge/V-tick arrowheads by subpath shape (<=6.5mm, acute tip 8°-60°) + dim-text/pair anchoring; upgrade if curved/dot tick terminators are needed
+// shortcut: detects CAD wedge/V-tick arrowheads (stroked or transient fill-only hints) + parallel offset thin lines with dim text; upgrade if curved/dot tick terminators are needed
 function promoteDimensionGeometry(
   segments: InternalSegment[],
   layers: CadLayer[],
@@ -873,7 +1049,8 @@ function promoteDimensionGeometry(
   titleBlockTopNy: number,
   pageWmm: number,
   pageHmm: number,
-  primaryOutlineWidth: number
+  primaryOutlineWidth: number,
+  fillArrowHints: TransientArrowHint[] = []
 ): void {
   if (segments.length === 0) return;
 
@@ -892,7 +1069,7 @@ function promoteDimensionGeometry(
     .filter((t) => t.ny < titleBlockTopNy && isDimensionTextToken(t.text))
     .map((t) => ({ x: t.nx * pageWmm, y: t.ny * pageHmm }));
 
-  // 1. Group into subpaths to detect any-color arrowheads (triangles or V-ticks)
+  // 1. Group into subpaths to detect stroked arrowheads (triangles or V-ticks) plus transient fill-only arrow hints
   const subpathMap = new Map<number, number[]>();
   for (let i = 0; i < segments.length; i++) {
     const sid = segments[i].subpathId || -(i + 1);
@@ -933,7 +1110,6 @@ function promoteDimensionGeometry(
     const span = Math.max(maxX - minX, maxY - minY);
     if (span < 0.65 || span > 6.5 || maxLen > 6.5) continue;
 
-    // Collect endpoints and test acute wedge vertices formed by two segments meeting at a tip
     const pts: Array<{ x: number; y: number; others: Array<{ x: number; y: number; len: number }> }> = [];
     for (const idx of idxs) {
       const c = coords[idx];
@@ -956,7 +1132,6 @@ function promoteDimensionGeometry(
       const v2x = (b.x - p.x) / b.len;
       const v2y = (b.y - p.y) / b.len;
       const cosA = v1x * v2x + v1y * v2y;
-      // Acute CAD arrowhead angle ~10°..58° (cos between 0.53 and 0.985)
       if (cosA >= 0.53 && cosA <= 0.988) {
         const bx = v1x + v2x;
         const by = v1y + v2y;
@@ -975,7 +1150,6 @@ function promoteDimensionGeometry(
       }
     }
 
-    // Require open 2-seg ticks or closed/filled 3-4 seg wedges to avoid stray open corners
     const isClosedOrFilled = segments[idxs[0]].isFilled || pts.every((p) => p.others.length >= 2);
     if (bestTip && (idxs.length === 2 || isClosedOrFilled)) {
       arrows.push(bestTip);
@@ -983,35 +1157,22 @@ function promoteDimensionGeometry(
     }
   }
 
-  if (arrows.length === 0) return;
-
-  // 2. Link arrowheads to collinear dimension/leader lines and anchor via dim text or opposing pairs
-  const arrowToLineIdx = new Map<number, number>();
-  const lineToArrows = new Map<number, number[]>();
-
-  for (let ai = 0; ai < arrows.length; ai++) {
-    const ar = arrows[ai];
-    let bestLine = -1;
-    let bestScore = Infinity;
-    for (let si = 0; si < segments.length; si++) {
-      if (arrowSegSet.has(si) || segments[si].isDashed) continue;
-      const c = coords[si];
-      if (c.len < 2.2) continue;
-      const align = Math.abs(c.ux * ar.axisX + c.uy * ar.axisY);
-      if (align < 0.90) continue;
-      const m = pointToSegMetrics(ar.tipX, ar.tipY, c.x1, c.y1, c.x2, c.y2);
-      if (m.dist <= 1.6 && m.tRaw >= -0.2 && m.tRaw <= 1.2) {
-        if (m.dist < bestScore) {
-          bestScore = m.dist;
-          bestLine = si;
-        }
-      }
-    }
-    if (bestLine !== -1) {
-      arrowToLineIdx.set(ai, bestLine);
-      const list = lineToArrows.get(bestLine);
-      if (list) list.push(ai);
-      else lineToArrows.set(bestLine, [ai]);
+  for (const hint of fillArrowHints) {
+    if (hint.tipNy >= titleBlockTopNy) continue;
+    const tipX = hint.tipNx * pageWmm;
+    const tipY = hint.tipNy * pageHmm;
+    const dx = hint.tailNx * pageWmm - tipX;
+    const dy = hint.tailNy * pageHmm - tipY;
+    const dLen = Math.hypot(dx, dy);
+    if (dLen > 1e-4) {
+      arrows.push({
+        segIndices: [],
+        tipX,
+        tipY,
+        axisX: dx / dLen,
+        axisY: dy / dLen,
+        confirmed: false,
+      });
     }
   }
 
@@ -1023,45 +1184,145 @@ function promoteDimensionGeometry(
     return dimTexts.some((t) => pointToSegMetrics(t.x, t.y, c.x1, c.y1, c.x2, c.y2).dist <= maxDist);
   };
 
-  for (let ai = 0; ai < arrows.length; ai++) {
-    const ar = arrows[ai];
-    const attachedLine = arrowToLineIdx.get(ai);
-    const hasPairedArrow =
-      (attachedLine !== undefined && (lineToArrows.get(attachedLine)?.length ?? 0) >= 2) ||
-      arrows.some((other, oi) => {
-        if (oi === ai) return false;
-        const dotAxis = ar.axisX * other.axisX + ar.axisY * other.axisY;
-        if (dotAxis > -0.88) return false;
-        const dx = other.tipX - ar.tipX;
-        const dy = other.tipY - ar.tipY;
-        const span = Math.hypot(dx, dy);
-        if (span < 3 || span > 260) return false;
-        const perp = Math.abs(dx * -ar.axisY + dy * ar.axisX);
-        return perp <= 2.2;
-      });
+  const promotedLines = new Set<number>();
+  const confirmedArrows: ArrowCandidate[] = [];
 
-    const hasTextAnchor =
-      nearDimText(ar.tipX, ar.tipY, 26) ||
-      (attachedLine !== undefined && lineNearDimText(attachedLine, 12));
+  if (arrows.length > 0) {
+    // 2. Link arrowheads to collinear dimension/leader lines and anchor via dim text or opposing pairs
+    const arrowToLineIdx = new Map<number, number>();
+    const lineToArrows = new Map<number, number[]>();
 
-    if (hasPairedArrow || hasTextAnchor) {
-      ar.confirmed = true;
+    for (let ai = 0; ai < arrows.length; ai++) {
+      const ar = arrows[ai];
+      let bestLine = -1;
+      let bestScore = Infinity;
+      for (let si = 0; si < segments.length; si++) {
+        if (arrowSegSet.has(si) || segments[si].isDashed) continue;
+        const c = coords[si];
+        if (c.len < 2.2) continue;
+        const align = Math.abs(c.ux * ar.axisX + c.uy * ar.axisY);
+        if (align < 0.90) continue;
+        const m = pointToSegMetrics(ar.tipX, ar.tipY, c.x1, c.y1, c.x2, c.y2);
+        if (m.dist <= 1.6 && m.tRaw >= -0.2 && m.tRaw <= 1.2) {
+          if (m.dist < bestScore) {
+            bestScore = m.dist;
+            bestLine = si;
+          }
+        }
+      }
+      if (bestLine !== -1) {
+        arrowToLineIdx.set(ai, bestLine);
+        const list = lineToArrows.get(bestLine);
+        if (list) list.push(ai);
+        else lineToArrows.set(bestLine, [ai]);
+      }
+    }
+
+    for (let ai = 0; ai < arrows.length; ai++) {
+      const ar = arrows[ai];
+      const attachedLine = arrowToLineIdx.get(ai);
+      const hasPairedArrow =
+        (attachedLine !== undefined && (lineToArrows.get(attachedLine)?.length ?? 0) >= 2) ||
+        arrows.some((other, oi) => {
+          if (oi === ai) return false;
+          const dotAxis = ar.axisX * other.axisX + ar.axisY * other.axisY;
+          if (dotAxis > -0.88) return false;
+          const dx = other.tipX - ar.tipX;
+          const dy = other.tipY - ar.tipY;
+          const span = Math.hypot(dx, dy);
+          if (span < 3 || span > 260) return false;
+          const perp = Math.abs(dx * -ar.axisY + dy * ar.axisX);
+          return perp <= 2.2;
+        });
+
+      const hasTextAnchor =
+        nearDimText(ar.tipX, ar.tipY, 26) ||
+        (attachedLine !== undefined && lineNearDimText(attachedLine, 12));
+
+      if (hasPairedArrow || hasTextAnchor) {
+        ar.confirmed = true;
+        confirmedArrows.push(ar);
+      }
+    }
+
+    for (let ai = 0; ai < arrows.length; ai++) {
+      const ar = arrows[ai];
+      if (!ar.confirmed) continue;
+      for (const idx of ar.segIndices) layers[idx] = 'dimension';
+      const si = arrowToLineIdx.get(ai);
+      if (si !== undefined) {
+        layers[si] = 'dimension';
+        promotedLines.add(si);
+      }
     }
   }
 
-  const confirmedArrows = arrows.filter((a) => a.confirmed);
-  if (confirmedArrows.length === 0) return;
+  // 3. Multi-signal fallback: thin non-dashed single/two-seg lines parallel to & offset (3..45 mm) from an outline with nearby numeric dim text
+  if (dimTexts.length > 0) {
+    const thinThreshold = Math.max(0.55, primaryOutlineWidth * 0.88);
+    const outlineCandidates: number[] = [];
+    for (let pi = 0; pi < segments.length; pi++) {
+      if (
+        !arrowSegSet.has(pi) &&
+        layers[pi] === 'outline' &&
+        !segments[pi].isDashed &&
+        coords[pi].len >= 4.0 &&
+        (segments[pi].effLineWidth > thinThreshold + 0.03 || segments[pi].pathSegCount >= 2)
+      ) {
+        outlineCandidates.push(pi);
+      }
+    }
 
-  const promotedLines = new Set<number>();
+    if (outlineCandidates.length > 0) {
+      for (let si = 0; si < segments.length; si++) {
+        if (arrowSegSet.has(si) || layers[si] !== 'outline' || segments[si].isDashed) continue;
+        if (segments[si].pathSegCount > 2 || segments[si].effLineWidth > thinThreshold) continue;
+        const c = coords[si];
+        if (c.len < 4.0) continue;
 
-  for (let ai = 0; ai < arrows.length; ai++) {
-    const ar = arrows[ai];
-    if (!ar.confirmed) continue;
-    for (const idx of ar.segIndices) layers[idx] = 'dimension';
-    const si = arrowToLineIdx.get(ai);
-    if (si !== undefined) {
-      layers[si] = 'dimension';
-      promotedLines.add(si);
+        let closestDimDist = Infinity;
+        let closestDimText: { x: number; y: number } | null = null;
+        for (let ti = 0; ti < dimTexts.length; ti++) {
+          const t = dimTexts[ti];
+          const m = pointToSegMetrics(t.x, t.y, c.x1, c.y1, c.x2, c.y2);
+          if (m.dist <= 6.0 && m.tRaw >= -0.15 && m.tRaw <= 1.15 && m.dist < closestDimDist) {
+            closestDimDist = m.dist;
+            closestDimText = t;
+          }
+        }
+        if (!closestDimText) continue;
+
+        let hasParallelOutline = false;
+        for (let oi = 0; oi < outlineCandidates.length; oi++) {
+          const pi = outlineCandidates[oi];
+          if (pi === si) continue;
+          const p = coords[pi];
+          if (Math.abs(c.ux * p.ux + c.uy * p.uy) < 0.96) continue;
+          const perpDist = Math.abs((c.x1 - p.x1) * -p.uy + (c.y1 - p.y1) * p.ux);
+          if (perpDist < 3.0 || perpDist > 45.0) continue;
+          const t1 = (c.x1 - p.x1) * p.ux + (c.y1 - p.y1) * p.uy;
+          const t2 = (c.x2 - p.x1) * p.ux + (c.y2 - p.y1) * p.uy;
+          const overlap = Math.min(Math.max(t1, t2), p.len) - Math.max(Math.min(t1, t2), 0);
+          if (overlap < Math.min(c.len, p.len) * 0.35) continue;
+          const textToOutlineDist = pointToSegMetrics(
+            closestDimText.x,
+            closestDimText.y,
+            p.x1,
+            p.y1,
+            p.x2,
+            p.y2
+          ).dist;
+          if (closestDimDist + 1.2 < textToOutlineDist) {
+            hasParallelOutline = true;
+            break;
+          }
+        }
+
+        if (hasParallelOutline) {
+          layers[si] = 'dimension';
+          promotedLines.add(si);
+        }
+      }
     }
   }
 
@@ -1093,7 +1354,19 @@ function promoteDimensionGeometry(
     }
   }
 
-  // 3. Detect orthogonal extension (witness) lines framing confirmed arrowheads
+  // 4. Detect orthogonal extension (witness) lines framing confirmed arrowheads or signal-3 dimension endpoints
+  const endpointAnchors: Array<{ tipX: number; tipY: number; axisX: number; axisY: number }> =
+    confirmedArrows.map((a) => ({ tipX: a.tipX, tipY: a.tipY, axisX: a.axisX, axisY: a.axisY }));
+  for (const di of promotedLines) {
+    const dc = coords[di];
+    endpointAnchors.push(
+      { tipX: dc.x1, tipY: dc.y1, axisX: dc.ux, axisY: dc.uy },
+      { tipX: dc.x2, tipY: dc.y2, axisX: -dc.ux, axisY: -dc.uy }
+    );
+  }
+
+  if (endpointAnchors.length === 0) return;
+
   for (let si = 0; si < segments.length; si++) {
     if (arrowSegSet.has(si) || layers[si] === 'dimension' || segments[si].isDashed) continue;
     if (segments[si].pathSegCount > 2) continue;
@@ -1101,9 +1374,9 @@ function promoteDimensionGeometry(
     if (c.len < 2.0) continue;
 
     const isThin = segments[si].effLineWidth <= primaryOutlineWidth * 0.90;
-    const isWitness = confirmedArrows.some((ar) => {
+    const isWitness = endpointAnchors.some((ar) => {
       const cosOrth = Math.abs(c.ux * ar.axisX + c.uy * ar.axisY);
-      if (cosOrth > 0.42) return false; // requires ~65°..115° to dimension axis
+      if (cosOrth > 0.42) return false;
       const m = pointToSegMetrics(ar.tipX, ar.tipY, c.x1, c.y1, c.x2, c.y2);
       if (m.dist > 1.8) return false;
       const distFromNearestEnd = Math.min(m.tClamped, 1 - m.tClamped) * c.len;
@@ -1117,12 +1390,140 @@ function promoteDimensionGeometry(
   }
 }
 
+function promoteCenterlineCrosshairs(
+  segments: InternalSegment[],
+  layers: CadLayer[],
+  primaryOutlineWidth: number,
+  pageWmm: number,
+  pageHmm: number
+): void {
+  if (segments.length === 0) return;
+
+  // Identify centers of closed curved/circular subpaths (e.g. bolt holes, bores) in sheet mm
+  const bySubpath = new Map<number, InternalSegment[]>();
+  for (let i = 0; i < segments.length; i++) {
+    const sid = segments[i].subpathId;
+    if (!sid) continue;
+    const list = bySubpath.get(sid);
+    if (list) list.push(segments[i]);
+    else bySubpath.set(sid, [segments[i]]);
+  }
+
+  const circleCenters: Array<{ cx: number; cy: number; r: number }> = [];
+  for (const sub of bySubpath.values()) {
+    if (sub.length < 6) continue;
+    let minX = Infinity;
+    let minY = Infinity;
+    let maxX = -Infinity;
+    let maxY = -Infinity;
+    for (let i = 0; i < sub.length; i++) {
+      const s = sub[i];
+      const x1 = s.nx1 * pageWmm;
+      const y1 = s.ny1 * pageHmm;
+      const x2 = s.nx2 * pageWmm;
+      const y2 = s.ny2 * pageHmm;
+      if (x1 < minX) minX = x1;
+      if (x2 < minX) minX = x2;
+      if (x1 > maxX) maxX = x1;
+      if (x2 > maxX) maxX = x2;
+      if (y1 < minY) minY = y1;
+      if (y2 < minY) minY = y2;
+      if (y1 > maxY) maxY = y1;
+      if (y2 > maxY) maxY = y2;
+    }
+    const w = maxX - minX;
+    const h = maxY - minY;
+    if (w >= 1.5 && h >= 1.5 && w / h >= 0.78 && w / h <= 1.28) {
+      circleCenters.push({ cx: (minX + maxX) * 0.5, cy: (minY + maxY) * 0.5, r: (w + h) * 0.25 });
+    }
+  }
+
+  const thinWidthCap = Math.max(0.5, primaryOutlineWidth * 0.86);
+  interface AxisCand {
+    idx: number;
+    isHoriz: boolean;
+    x1: number;
+    y1: number;
+    x2: number;
+    y2: number;
+    mx: number;
+    my: number;
+    len: number;
+  }
+
+  const horizCands: AxisCand[] = [];
+  const vertCands: AxisCand[] = [];
+
+  for (let i = 0; i < segments.length; i++) {
+    const s = segments[i];
+    if (layers[i] !== 'outline' || s.isDashed) continue;
+    if (s.pathSegCount !== 1 || s.effLineWidth > thinWidthCap || s.lenMm > 14 || s.lenMm < 0.5) {
+      continue;
+    }
+    const x1 = s.nx1 * pageWmm;
+    const y1 = s.ny1 * pageHmm;
+    const x2 = s.nx2 * pageWmm;
+    const y2 = s.ny2 * pageHmm;
+    const dx = Math.abs(x2 - x1);
+    const dy = Math.abs(y2 - y1);
+    const len = Math.hypot(dx, dy);
+    if (len < 0.5) continue;
+
+    const isHoriz = dy <= 0.08 * len;
+    const isVert = dx <= 0.08 * len;
+    if (!isHoriz && !isVert) continue;
+
+    const mx = (x1 + x2) * 0.5;
+    const my = (y1 + y2) * 0.5;
+
+    // Consistent with a circular bore center
+    const nearCircleCenter = circleCenters.some(
+      (c) => Math.hypot(mx - c.cx, my - c.cy) <= Math.max(1.0, c.r * 0.18) && len <= c.r * 3.6
+    );
+    if (nearCircleCenter) {
+      layers[i] = 'centerline';
+      continue;
+    }
+
+    const cand: AxisCand = {
+      idx: i,
+      isHoriz,
+      x1: Math.min(x1, x2),
+      y1: Math.min(y1, y2),
+      x2: Math.max(x1, x2),
+      y2: Math.max(y1, y2),
+      mx,
+      my,
+      len,
+    };
+    if (isHoriz) horizCands.push(cand);
+    else vertCands.push(cand);
+  }
+
+  // Also allow dashed centerline crosshairs to confirm an orthogonal non-dashed axis pair
+  vertCands.sort((a, b) => a.mx - b.mx);
+  for (let hi = 0; hi < horizCands.length; hi++) {
+    const h = horizCands[hi];
+    for (let vi = 0; vi < vertCands.length; vi++) {
+      const v = vertCands[vi];
+      if (v.mx < h.x1 + h.len * 0.15) continue;
+      if (v.mx > h.x2 - h.len * 0.15) break;
+      if (h.my >= v.y1 + v.len * 0.15 && h.my <= v.y2 - v.len * 0.15) {
+        layers[h.idx] = 'centerline';
+        layers[v.idx] = 'centerline';
+      }
+    }
+  }
+}
+
 interface CollinearEndpoint {
   xMm: number;
   yMm: number;
   nx: number;
   ny: number;
 }
+
+const sameSubpathCollinearMergedSet = new WeakSet<RawNormalizedSegment>();
 
 function makeStrokeStyleKey(seg: InternalSegment): string {
   return `${seg.effLineWidth.toFixed(2)}:${seg.strokeLuminance.toFixed(2)}:${seg.isDashed ? 1 : 0}`;
@@ -1131,15 +1532,36 @@ function makeStrokeStyleKey(seg: InternalSegment): string {
 function mergeCollinearSegments(segments: RawNormalizedSegment[]): RawNormalizedSegment[] {
   if (segments.length <= 1) return segments;
 
-  const groups = new Map<string, RawNormalizedSegment[]>();
+  // Count how many segments share each subpathId so multi-segment contours preserve ordered vertex chains
+  const subpathCounts = new Map<number, number>();
   for (const s of segments) {
+    if (s.subpathId && s.subpathId > 0) {
+      subpathCounts.set(s.subpathId, (subpathCounts.get(s.subpathId) ?? 0) + 1);
+    }
+  }
+
+  const out: RawNormalizedSegment[] = [];
+  const mergeEligible: RawNormalizedSegment[] = [];
+  for (const s of segments) {
+    if (s.subpathId && s.subpathId > 0 && (subpathCounts.get(s.subpathId) ?? 0) >= 2) {
+      out.push(s);
+    } else {
+      mergeEligible.push(s);
+    }
+  }
+
+  if (mergeEligible.length <= 1) {
+    for (const s of mergeEligible) out.push(s);
+    return out;
+  }
+
+  const groups = new Map<string, RawNormalizedSegment[]>();
+  for (const s of mergeEligible) {
     const key = `${s.layerHint || 'outline'}|${s.strokeStyleKey || 'default'}`;
     const bucket = groups.get(key);
     if (bucket) bucket.push(s);
     else groups.set(key, [s]);
   }
-
-  const out: RawNormalizedSegment[] = [];
 
   for (const group of groups.values()) {
     if (group.length <= 1) {
@@ -1158,6 +1580,8 @@ function mergeCollinearSegments(segments: RawNormalizedSegment[]): RawNormalized
       pMax: CollinearEndpoint;
       layerHint?: CadLayer;
       strokeStyleKey?: string;
+      subpathId?: number;
+      mergedCount: number;
     }
 
     const items: LineItem[] = [];
@@ -1195,6 +1619,8 @@ function mergeCollinearSegments(segments: RawNormalizedSegment[]): RawNormalized
         pMax,
         layerHint: s.layerHint,
         strokeStyleKey: s.strokeStyleKey,
+        subpathId: s.subpathId,
+        mergedCount: 1,
       });
     }
 
@@ -1208,7 +1634,7 @@ function mergeCollinearSegments(segments: RawNormalizedSegment[]): RawNormalized
 
     const active: LineItem[] = [];
     const flushItem = (it: LineItem) => {
-      out.push({
+      const seg: RawNormalizedSegment = {
         nx1: it.pMin.nx,
         ny1: it.pMin.ny,
         nx2: it.pMax.nx,
@@ -1219,7 +1645,12 @@ function mergeCollinearSegments(segments: RawNormalizedSegment[]): RawNormalized
         y2Mm: Number(it.pMax.yMm.toFixed(3)),
         layerHint: it.layerHint,
         strokeStyleKey: it.strokeStyleKey,
-      });
+        ...(it.subpathId !== undefined ? { subpathId: it.subpathId } : {}),
+      };
+      if (it.subpathId && it.subpathId > 0 && it.mergedCount >= 2) {
+        sameSubpathCollinearMergedSet.add(seg);
+      }
+      out.push(seg);
     };
 
     for (const it of items) {
@@ -1249,6 +1680,10 @@ function mergeCollinearSegments(segments: RawNormalizedSegment[]): RawNormalized
             cur.maxT = it.maxT;
             cur.pMax = it.pMax;
           }
+          cur.mergedCount += it.mergedCount;
+          if (cur.subpathId !== it.subpathId) {
+            cur.subpathId = undefined;
+          }
           merged = true;
           break;
         }
@@ -1257,6 +1692,405 @@ function mergeCollinearSegments(segments: RawNormalizedSegment[]): RawNormalized
     }
 
     for (const rem of active) flushItem(rem);
+  }
+
+  return out;
+}
+
+interface CircleFitResult {
+  cx: number;
+  cy: number;
+  r: number;
+  rmsErr: number;
+  maxErr: number;
+}
+
+function fitCircleLeastSquares(pts: ReadonlyArray<{ x: number; y: number }>): CircleFitResult | null {
+  const n = pts.length;
+  if (n < 3) return null;
+  let sx = 0;
+  let sy = 0;
+  for (let i = 0; i < n; i++) {
+    sx += pts[i].x;
+    sy += pts[i].y;
+  }
+  const mx = sx / n;
+  const my = sy / n;
+  let suu = 0;
+  let suv = 0;
+  let svv = 0;
+  let suuu = 0;
+  let suvv = 0;
+  let svvv = 0;
+  let svuu = 0;
+  for (let i = 0; i < n; i++) {
+    const u = pts[i].x - mx;
+    const v = pts[i].y - my;
+    const uu = u * u;
+    const vv = v * v;
+    suu += uu;
+    svv += vv;
+    suv += u * v;
+    suuu += uu * u;
+    suvv += u * vv;
+    svvv += vv * v;
+    svuu += v * uu;
+  }
+  const denom = 2 * (suu * svv - suv * suv);
+  if (!Number.isFinite(denom) || Math.abs(denom) < 1e-10) return null;
+  const uc = (svv * (suuu + suvv) - suv * (svvv + svuu)) / denom;
+  const vc = (suu * (svvv + svuu) - suv * (suuu + suvv)) / denom;
+  const cx = mx + uc;
+  const cy = my + vc;
+  const rSq = uc * uc + vc * vc + (suu + svv) / n;
+  if (!Number.isFinite(rSq) || rSq <= 0) return null;
+  const r = Math.sqrt(rSq);
+  if (!Number.isFinite(cx) || !Number.isFinite(cy) || !Number.isFinite(r) || r <= 0) return null;
+
+  let maxErr = 0;
+  let sumSqErr = 0;
+  for (let i = 0; i < n; i++) {
+    const err = Math.abs(Math.hypot(pts[i].x - cx, pts[i].y - cy) - r);
+    if (err > maxErr) maxErr = err;
+    sumSqErr += err * err;
+  }
+  return { cx, cy, r, rmsErr: Math.sqrt(sumSqErr / n), maxErr };
+}
+
+function normDeg(deg: number): number {
+  let d = deg % 360;
+  if (d < 0) d += 360;
+  return Number(d.toFixed(3));
+}
+
+function signedStepTurnRad(a: RawNormalizedSegment, b: RawNormalizedSegment): number {
+  const ax = a.x2Mm - a.x1Mm;
+  const ay = a.y2Mm - a.y1Mm;
+  const bx = b.x2Mm - b.x1Mm;
+  const by = b.y2Mm - b.y1Mm;
+  return Math.atan2(ax * by - ay * bx, ax * bx + ay * by);
+}
+
+function isClosedCircleCandidate(
+  segs: RawNormalizedSegment[],
+  rmsTolPaper: number
+): CircleFitResult | null {
+  if (segs.length < 6) return null;
+  const first = segs[0];
+  const last = segs[segs.length - 1];
+  if (Math.hypot(first.x1Mm - last.x2Mm, first.y1Mm - last.y2Mm) > 0.12) return null;
+  const pts: Array<{ x: number; y: number }> = [];
+  for (let i = 0; i < segs.length; i++) {
+    if (i > 0) {
+      const prev = segs[i - 1];
+      if (Math.hypot(prev.x2Mm - segs[i].x1Mm, prev.y2Mm - segs[i].y1Mm) > 0.12) {
+        return null;
+      }
+    }
+    pts.push({ x: segs[i].x1Mm, y: segs[i].y1Mm });
+  }
+  const fit = fitCircleLeastSquares(pts);
+  if (!fit || fit.r < 0.4 || fit.r > 2000) return null;
+  const maxAllowedErr = Math.max(0.038, rmsTolPaper * 1.9, fit.r * 0.0025);
+  if (fit.rmsErr > rmsTolPaper || fit.maxErr > maxAllowedErr) return null;
+
+  // Verify vertices span all around the circle and no long flat chord cuts across
+  for (let i = 0; i < segs.length; i++) {
+    const segLen = Math.hypot(segs[i].x2Mm - segs[i].x1Mm, segs[i].y2Mm - segs[i].y1Mm);
+    const chordAng = 2 * Math.asin(Math.min(1, segLen / (2 * fit.r)));
+    if (chordAng > Math.PI / 3) return null;
+  }
+  const angles = pts
+    .map((p) => Math.atan2(p.y - fit.cy, p.x - fit.cx))
+    .sort((a, b) => a - b);
+  let maxGap = Math.PI * 2 - (angles[angles.length - 1] - angles[0]);
+  for (let i = 1; i < angles.length; i++) {
+    const gap = angles[i] - angles[i - 1];
+    if (gap > maxGap) maxGap = gap;
+  }
+  if (maxGap > Math.PI * 0.45) return null;
+  return fit;
+}
+
+export function recoverPrimitivesFromSegments(
+  segments: RawNormalizedSegment[],
+  opts: {
+    idPrefix?: string;
+    viewId?: string;
+    offsetX?: number;
+    offsetY?: number;
+    scaleFactor?: number;
+    toleranceRealMm?: number;
+  } = {}
+): CadEntity[] {
+  const idPrefix = opts.idPrefix || 'pdf-vec';
+  const viewId = opts.viewId;
+  const ox = opts.offsetX ?? 0;
+  const oy = opts.offsetY ?? 0;
+  const rmsTolPaper =
+    opts.toleranceRealMm !== undefined && opts.scaleFactor && opts.scaleFactor <= 1.05
+      ? opts.toleranceRealMm
+      : 0.02;
+
+  // Group segments by subpathId; segments without a subpathId stay standalone unless contiguous
+  const orderedGroups: RawNormalizedSegment[][] = [];
+  const subpathBucketIdx = new Map<number, number>();
+  for (let i = 0; i < segments.length; i++) {
+    const seg = segments[i];
+    if (seg.subpathId && seg.subpathId > 0) {
+      const existing = subpathBucketIdx.get(seg.subpathId);
+      if (existing !== undefined) {
+        orderedGroups[existing].push(seg);
+      } else {
+        subpathBucketIdx.set(seg.subpathId, orderedGroups.length);
+        orderedGroups.push([seg]);
+      }
+    } else {
+      const prevGroup = orderedGroups.length > 0 ? orderedGroups[orderedGroups.length - 1] : null;
+      const prevSeg = prevGroup && !prevGroup[0].subpathId ? prevGroup[prevGroup.length - 1] : null;
+      if (
+        prevGroup &&
+        prevSeg &&
+        (prevSeg.layerHint || 'outline') === (seg.layerHint || 'outline') &&
+        (prevSeg.strokeStyleKey || '') === (seg.strokeStyleKey || '') &&
+        Math.hypot(prevSeg.x2Mm - seg.x1Mm, prevSeg.y2Mm - seg.y1Mm) <= 0.08
+      ) {
+        prevGroup.push(seg);
+      } else {
+        orderedGroups.push([seg]);
+      }
+    }
+  }
+
+  const out: CadEntity[] = [];
+  let seq = 1;
+  const nextId = () => `${idPrefix}-${seq++}`;
+  const baseFields = (layer: CadLayer, source: 'vector' | 'recovered') => ({
+    id: nextId(),
+    ...(viewId ? { viewId } : {}),
+    layer,
+    source,
+  });
+
+  const emitLineOrMergedPolyline = (s: RawNormalizedSegment) => {
+    const layer = s.layerHint || 'outline';
+    if (sameSubpathCollinearMergedSet.has(s)) {
+      out.push({
+        ...baseFields(layer, 'recovered'),
+        type: 'polyline',
+        points: [
+          { x: Number((s.x1Mm + ox).toFixed(3)), y: Number((s.y1Mm + oy).toFixed(3)) },
+          { x: Number((s.x2Mm + ox).toFixed(3)), y: Number((s.y2Mm + oy).toFixed(3)) },
+        ],
+        closed: false,
+      });
+    } else {
+      out.push({
+        ...baseFields(layer, 'vector'),
+        type: 'line',
+        x1: Number((s.x1Mm + ox).toFixed(3)),
+        y1: Number((s.y1Mm + oy).toFixed(3)),
+        x2: Number((s.x2Mm + ox).toFixed(3)),
+        y2: Number((s.y2Mm + oy).toFixed(3)),
+      });
+    }
+  };
+
+  for (const group of orderedGroups) {
+    if (group.length === 1) {
+      emitLineOrMergedPolyline(group[0]);
+      continue;
+    }
+
+    const uniformLayer = group.every((s) => (s.layerHint || 'outline') === (group[0].layerHint || 'outline'));
+    const uniformStyle = group.every((s) => (s.strokeStyleKey || '') === (group[0].strokeStyleKey || ''));
+    if (uniformLayer && uniformStyle) {
+      const circleFit = isClosedCircleCandidate(group, rmsTolPaper);
+      if (circleFit) {
+        out.push({
+          ...baseFields(group[0].layerHint || 'outline', 'recovered'),
+          type: 'circle',
+          cx: Number((circleFit.cx + ox).toFixed(3)),
+          cy: Number((circleFit.cy + oy).toFixed(3)),
+          r: Number(circleFit.r.toFixed(3)),
+        });
+        continue;
+      }
+    }
+
+    // Split into contiguous chains with uniform layer & style
+    const chains: RawNormalizedSegment[][] = [];
+    for (const seg of group) {
+      const cur = chains.length > 0 ? chains[chains.length - 1] : null;
+      const prev = cur ? cur[cur.length - 1] : null;
+      if (
+        cur &&
+        prev &&
+        (prev.layerHint || 'outline') === (seg.layerHint || 'outline') &&
+        (prev.strokeStyleKey || '') === (seg.strokeStyleKey || '') &&
+        Math.hypot(prev.x2Mm - seg.x1Mm, prev.y2Mm - seg.y1Mm) <= 0.08
+      ) {
+        cur.push(seg);
+      } else {
+        chains.push([seg]);
+      }
+    }
+
+    for (const chain of chains) {
+      const m = chain.length;
+      if (m === 1) {
+        emitLineOrMergedPolyline(chain[0]);
+        continue;
+      }
+      const layer = chain[0].layerHint || 'outline';
+      let i = 0;
+      while (i < m) {
+        // 1. Try longest arc run of >= 3 consecutive chords (4+ points)
+        let arcMatched = false;
+        if (i + 2 < m) {
+          const l0 = Math.hypot(chain[i].x2Mm - chain[i].x1Mm, chain[i].y2Mm - chain[i].y1Mm);
+          const l1 = Math.hypot(chain[i + 1].x2Mm - chain[i + 1].x1Mm, chain[i + 1].y2Mm - chain[i + 1].y1Mm);
+          const l2 = Math.hypot(chain[i + 2].x2Mm - chain[i + 2].x1Mm, chain[i + 2].y2Mm - chain[i + 2].y1Mm);
+          const minL = Math.min(l0, l1, l2);
+          const maxL = Math.max(l0, l1, l2);
+          const t01 = signedStepTurnRad(chain[i], chain[i + 1]);
+          const t12 = signedStepTurnRad(chain[i + 1], chain[i + 2]);
+          const minTurnRad = (0.8 * Math.PI) / 180;
+          const maxTurnRad = (50 * Math.PI) / 180;
+          if (
+            minL >= 0.12 &&
+            maxL / minL <= 3.5 &&
+            t01 * t12 > 0 &&
+            Math.abs(t01) >= minTurnRad &&
+            Math.abs(t01) <= maxTurnRad &&
+            Math.abs(t12) >= minTurnRad &&
+            Math.abs(t12) <= maxTurnRad
+          ) {
+            const pts: Array<{ x: number; y: number }> = [
+              { x: chain[i].x1Mm, y: chain[i].y1Mm },
+              { x: chain[i].x2Mm, y: chain[i].y2Mm },
+              { x: chain[i + 1].x2Mm, y: chain[i + 1].y2Mm },
+              { x: chain[i + 2].x2Mm, y: chain[i + 2].y2Mm },
+            ];
+            let bestFit = fitCircleLeastSquares(pts);
+            let bestEndIdx = i + 2;
+            const turnSign = t01 > 0 ? 1 : -1;
+            let lenSum = l0 + l1 + l2;
+            let count = 3;
+
+            const isValidFit = (f: CircleFitResult | null) =>
+              f !== null &&
+              f.r >= 0.4 &&
+              f.r <= 2000 &&
+              f.rmsErr <= rmsTolPaper &&
+              f.maxErr <= Math.max(0.038, rmsTolPaper * 1.9, f.r * 0.0025);
+
+            if (isValidFit(bestFit) && bestFit) {
+              for (let j = i + 3; j < m; j++) {
+                const lj = Math.hypot(chain[j].x2Mm - chain[j].x1Mm, chain[j].y2Mm - chain[j].y1Mm);
+                const meanL = lenSum / count;
+                if (lj < 0.12 || lj > meanL * 2.5 || lj < meanL * 0.35) break;
+                const tj = signedStepTurnRad(chain[j - 1], chain[j]);
+                if (tj * turnSign <= 0 || Math.abs(tj) < minTurnRad || Math.abs(tj) > maxTurnRad) break;
+                pts.push({ x: chain[j].x2Mm, y: chain[j].y2Mm });
+                const candFit = fitCircleLeastSquares(pts);
+                if (
+                  !isValidFit(candFit) ||
+                  !candFit ||
+                  Math.abs(candFit.r - bestFit.r) > Math.max(0.15, bestFit.r * 0.08)
+                ) {
+                  pts.pop();
+                  break;
+                }
+                bestFit = candFit;
+                bestEndIdx = j;
+                lenSum += lj;
+                count++;
+              }
+
+              // Compute total signed sweep around bestFit center
+              let sweepRad = 0;
+              for (let p = 0; p < pts.length - 1; p++) {
+                const a0 = Math.atan2(pts[p].y - bestFit.cy, pts[p].x - bestFit.cx);
+                const a1 = Math.atan2(pts[p + 1].y - bestFit.cy, pts[p + 1].x - bestFit.cx);
+                let da = a1 - a0;
+                while (da > Math.PI) da -= Math.PI * 2;
+                while (da < -Math.PI) da += Math.PI * 2;
+                sweepRad += da;
+              }
+              const absSweepRad = Math.abs(sweepRad);
+              const sagitta = bestFit.r * (1 - Math.cos(Math.min(Math.PI, absSweepRad) / 2));
+              if (absSweepRad >= (10 * Math.PI) / 180 && sagitta >= 0.05) {
+                const startPt = pts[0];
+                const endPt = pts[pts.length - 1];
+                const closeGap = Math.hypot(startPt.x - endPt.x, startPt.y - endPt.y);
+                if (absSweepRad >= (352 * Math.PI) / 180 && closeGap <= 0.15) {
+                  out.push({
+                    ...baseFields(layer, 'recovered'),
+                    type: 'circle',
+                    cx: Number((bestFit.cx + ox).toFixed(3)),
+                    cy: Number((bestFit.cy + oy).toFixed(3)),
+                    r: Number(bestFit.r.toFixed(3)),
+                  });
+                } else {
+                  const ang0 = normDeg((Math.atan2(startPt.y - bestFit.cy, startPt.x - bestFit.cx) * 180) / Math.PI);
+                  const ang1 = normDeg((Math.atan2(endPt.y - bestFit.cy, endPt.x - bestFit.cx) * 180) / Math.PI);
+                  const isCcw = sweepRad >= 0;
+                  out.push({
+                    ...baseFields(layer, 'recovered'),
+                    type: 'arc',
+                    cx: Number((bestFit.cx + ox).toFixed(3)),
+                    cy: Number((bestFit.cy + oy).toFixed(3)),
+                    r: Number(bestFit.r.toFixed(3)),
+                    startAngle: isCcw ? ang0 : ang1,
+                    endAngle: isCcw ? ang1 : ang0,
+                  });
+                }
+                i = bestEndIdx + 1;
+                arcMatched = true;
+              }
+            }
+          }
+        }
+        if (arcMatched) continue;
+
+        // 2. Merge consecutive collinear runs (>= 2 segments) into CadPolylineEntity
+        const s0 = chain[i];
+        const dx0 = s0.x2Mm - s0.x1Mm;
+        const dy0 = s0.y2Mm - s0.y1Mm;
+        const len0 = Math.hypot(dx0, dy0) || 1e-6;
+        const ux0 = dx0 / len0;
+        const uy0 = dy0 / len0;
+        let colEnd = i;
+        while (colEnd + 1 < m) {
+          const sn = chain[colEnd + 1];
+          const dxn = sn.x2Mm - sn.x1Mm;
+          const dyn = sn.y2Mm - sn.y1Mm;
+          const lenn = Math.hypot(dxn, dyn) || 1e-6;
+          const dot = (dxn / lenn) * ux0 + (dyn / lenn) * uy0;
+          if (dot < 0.9999) break;
+          const perp = Math.abs((sn.x2Mm - s0.x1Mm) * -uy0 + (sn.y2Mm - s0.y1Mm) * ux0);
+          if (perp > 0.035) break;
+          colEnd++;
+        }
+
+        if (colEnd > i) {
+          out.push({
+            ...baseFields(layer, 'recovered'),
+            type: 'polyline',
+            points: [
+              { x: Number((chain[i].x1Mm + ox).toFixed(3)), y: Number((chain[i].y1Mm + oy).toFixed(3)) },
+              { x: Number((chain[colEnd].x2Mm + ox).toFixed(3)), y: Number((chain[colEnd].y2Mm + oy).toFixed(3)) },
+            ],
+            closed: false,
+          });
+          i = colEnd + 1;
+        } else {
+          emitLineOrMergedPolyline(s0);
+          i++;
+        }
+      }
+    }
   }
 
   return out;
@@ -1335,20 +2169,28 @@ export function buildPayloadGeometry(
     (seg) => !isSheetChromeSegment(seg, titleBlockTopNy, chromeCtx)
   );
 
-  const darkWidths = drawingSegments
-    .filter((s) => s.strokeLuminance < 0.28 && !s.isDashed)
-    .map((s) => s.effLineWidth);
-  const primaryOutlineWidth = darkWidths.length > 0 ? Math.max(...darkWidths) : 0.6;
+  const primaryOutlineWidth = computePrimaryOutlineWidth(drawingSegments);
+  const fillArrowHints = fillOnlyArrowHintsMap.get(allInternalSegments) ?? [];
 
   const drawingLayers = drawingSegments.map((seg) => classifySegmentLayer(seg, primaryOutlineWidth));
+  const pageWmm = pageWidthPt * PT_TO_MM;
+  const pageHmm = pageHeightPt * PT_TO_MM;
   promoteDimensionGeometry(
     drawingSegments,
     drawingLayers,
     rawNormalizedTextItems,
     titleBlockTopNy,
-    pageWidthPt * PT_TO_MM,
-    pageHeightPt * PT_TO_MM,
-    primaryOutlineWidth
+    pageWmm,
+    pageHmm,
+    primaryOutlineWidth,
+    fillArrowHints
+  );
+  promoteCenterlineCrosshairs(
+    drawingSegments,
+    drawingLayers,
+    primaryOutlineWidth,
+    pageWmm,
+    pageHmm
   );
 
   const allNormalizedSegments: RawNormalizedSegment[] = drawingSegments.map((seg, idx) => ({
@@ -1362,6 +2204,7 @@ export function buildPayloadGeometry(
     y2Mm: seg.y2Mm,
     layerHint: drawingLayers[idx],
     strokeStyleKey: makeStrokeStyleKey(seg),
+    subpathId: seg.subpathId,
   }));
 
   const prelimTitleMeta = parseTitleBlockMetadata(rawNormalizedTextItems, allNormalizedSegments);
@@ -1419,15 +2262,12 @@ export function buildPayloadGeometry(
   const centerX = (minX + maxX) / 2;
   const centerY = (minY + maxY) / 2;
 
-  const centeredEntities: CadEntity[] = retainedSegs.map((s, idx) => ({
-    id: `pdf-vec-${idx + 1}`,
-    layer: s.layerHint || 'outline',
-    type: 'line',
-    x1: Number((s.x1Mm - centerX).toFixed(3)),
-    y1: Number((s.y1Mm - centerY).toFixed(3)),
-    x2: Number((s.x2Mm - centerX).toFixed(3)),
-    y2: Number((s.y2Mm - centerY).toFixed(3)),
-  }));
+  const centeredEntities = recoverPrimitivesFromSegments(retainedSegs, {
+    idPrefix: 'pdf-vec',
+    offsetX: -centerX,
+    offsetY: -centerY,
+    scaleFactor: calibrated.scaleFactor || titleBlockMeta.scaleFactor || 1,
+  });
 
   const droppedSegmentCount = compactedTotal.droppedSegmentCount + chunkBuild.droppedSegmentCount;
 
@@ -1497,16 +2337,28 @@ export function parseTitleBlockMetadata(
 
   // shortcut: infers missing scale only against standard architectural/CAD integer ratios; upgrade if arbitrary fractional scales lack title-block text
   if (!scaleFactor && segments.length > 0) {
-    const dimNums = textItems
-      .filter((t) => t.ny < 0.76 && /^\d{2,4}(?:\.\d+)?$/.test(t.text.trim()))
-      .map((t) => Number(t.text.trim()))
-      .filter((n) => Number.isFinite(n) && n >= 20 && n <= 10000);
-    if (dimNums.length > 0) {
-      const maxDimVal = Math.max(...dimNums);
-      const geomSegs = segments.filter((s) => s.layerHint !== 'dimension');
-      if (geomSegs.length > 0) {
-        const minX = Math.min(...geomSegs.flatMap((s) => [s.x1Mm, s.x2Mm]));
-        const maxX = Math.max(...geomSegs.flatMap((s) => [s.x1Mm, s.x2Mm]));
+    let maxDimVal = -Infinity;
+    for (let i = 0; i < textItems.length; i++) {
+      const t = textItems[i];
+      if (t.ny < 0.76 && /^\d{2,4}(?:\.\d+)?$/.test(t.text.trim())) {
+        const n = Number(t.text.trim());
+        if (Number.isFinite(n) && n >= 20 && n <= 10000 && n > maxDimVal) {
+          maxDimVal = n;
+        }
+      }
+    }
+    if (Number.isFinite(maxDimVal)) {
+      let minX = Infinity;
+      let maxX = -Infinity;
+      for (let i = 0; i < segments.length; i++) {
+        const s = segments[i];
+        if (s.layerHint === 'dimension') continue;
+        if (s.x1Mm < minX) minX = s.x1Mm;
+        if (s.x2Mm < minX) minX = s.x2Mm;
+        if (s.x1Mm > maxX) maxX = s.x1Mm;
+        if (s.x2Mm > maxX) maxX = s.x2Mm;
+      }
+      if (Number.isFinite(minX)) {
         const spanMm = maxX - minX;
         if (spanMm > 10 && maxDimVal / spanMm > 1.8) {
           const ratio = Math.round(maxDimVal / spanMm);
@@ -1519,35 +2371,53 @@ export function parseTitleBlockMetadata(
     }
   }
 
+  const isTitleBlockFieldLabel = (rawText: string): boolean => {
+    const trimmed = rawText.trim();
+    if (!trimmed) return true;
+    if (/[:=]$/.test(trimmed)) return true;
+    return /^(?:TITLE|PART\s*NAME|DESCRIPTION|DWG\s*NO\.?|DRAWING\s*NO\.?|PART\s*NO\.?|REV(?:ISION)?|MAT(?:ERIAL)?|WEIGHT|MASS|SCALE|SHEET(?:\s*\d+\s*OF\s*\d+)?|SIZE|DRAWN(?:\s*BY)?|CHK'?D|CHECKED(?:\s*BY)?|APPV'?D|APPROVED(?:\s*BY)?|ENG(?:INEER)?|MFG|Q\.?A\.?|DATE|NAME|SIGNATURE|FINISH|SURFACE\s+FINISH|TOLERANCES?|ANGULAR|LINEAR|DO\s+NOT\s+SCALE(?:\s+DRAWING)?|DIMENSIONS\s+ARE\s+IN\s+\w+|UNLESS\s+OTHERWISE\s+SPECIFIED|THIRD\s+ANGLE\s+PROJECTION|FIRST\s+ANGLE\s+PROJECTION|PROPRIETARY|CONFIDENTIAL|DEBURR\s+AND|BREAK\s+SHARP|EDGES?|A[0-4])$/i.test(
+      trimmed
+    );
+  };
+
   const findNearbyValue = (
     labelRegex: RegExp,
-    opts: { maxDx?: number; minDx?: number; minDy?: number; maxDy?: number; exclude?: RegExp } = {}
+    opts: { maxDx?: number; minDx?: number; maxDy?: number } = {}
   ): string | undefined => {
-    const anchor = textItems.find((t) => labelRegex.test(t.text));
+    const anchor = textItems.find((t) => labelRegex.test(t.text.trim()));
     if (!anchor) return undefined;
     const inlineMatch = anchor.text.match(/[:=]\s*(.+)$/);
-    if (inlineMatch && inlineMatch[1].trim().length >= 2) {
-      return inlineMatch[1].trim();
+    if (inlineMatch) {
+      const inlineVal = inlineMatch[1].trim();
+      if (inlineVal.length >= 1 && !isTitleBlockFieldLabel(inlineVal)) {
+        return inlineVal;
+      }
     }
     const maxDx = opts.maxDx ?? 0.22;
     const minDx = opts.minDx ?? -0.02;
-    const minDy = opts.minDy ?? -0.02;
     const maxDy = opts.maxDy ?? 0.05;
 
     const candidates = textItems
       .filter((t) => {
         if (t === anchor) return false;
+        const val = t.text.trim();
+        if (!val || isTitleBlockFieldLabel(val)) return false;
         const dx = t.nx - anchor.nx;
         const dy = t.ny - anchor.ny;
-        if (dx < minDx || dx > maxDx || dy < minDy || dy > maxDy) return false;
-        if (opts.exclude && opts.exclude.test(t.text)) return false;
-        return t.text.trim().length > 0;
+        // Reject items on rows above the label; same row must be to the right, lower rows within cell bounds
+        if (dy < -0.008 || dy > maxDy || dx > maxDx) return false;
+        if (dy <= 0.008) {
+          if (dx <= 0.004) return false;
+        } else if (dx < minDx) {
+          return false;
+        }
+        return true;
       })
-      .sort(
-        (a, b) =>
-          Math.hypot(a.nx - anchor.nx, a.ny - anchor.ny) -
-          Math.hypot(b.nx - anchor.nx, b.ny - anchor.ny)
-      );
+      .sort((a, b) => {
+        const da = Math.hypot(a.nx - anchor.nx, (a.ny - anchor.ny) * 2.5);
+        const db = Math.hypot(b.nx - anchor.nx, (b.ny - anchor.ny) * 2.5);
+        return da - db;
+      });
 
     return candidates[0]?.text.trim();
   };
@@ -1555,32 +2425,23 @@ export function parseTitleBlockMetadata(
   return {
     partName: findNearbyValue(/^(?:TITLE|PART\s*NAME)\s*[:.]?$/i, {
       maxDx: 0.25,
-      minDy: -0.01,
       maxDy: 0.06,
-      exclude: /^(?:DO NOT SCALE|DWG NO|SHEET|REVISION|RS Engineering)/i,
     }),
     partNumber: findNearbyValue(/(?:DWG\s*NO\.?|PART\s*NO\.?)/i, {
       maxDx: 0.22,
-      minDy: -0.015,
       maxDy: 0.045,
-      exclude: /^(?:SCALE|SHEET|A[0-4]|MATERIAL)/i,
     }),
     revision: findNearbyValue(/^REV(?:ISION)?\s*[:.]?$/i, {
       maxDx: 0.14,
-      minDy: -0.015,
       maxDy: 0.025,
-      exclude: /^(?:RS Engineering|DO NOT SCALE)/i,
     }),
     material: findNearbyValue(/^MAT(?:ERIAL)?\s*[:.]?$/i, {
       maxDx: 0.2,
-      minDy: -0.015,
       maxDy: 0.045,
-      exclude: /^(?:WEIGHT|DWG|SCALE|Q\.A)/i,
     }),
     units,
     weight: findNearbyValue(/^WEIGHT\s*[:.]?$/i, {
       maxDx: 0.14,
-      minDy: -0.015,
       maxDy: 0.025,
     }),
     scaleLabel,
@@ -1623,18 +2484,67 @@ function classifyViewFromFeatures(
   }
 
   if (clusterSegs.length > 0) {
-    const xs = clusterSegs.flatMap((s) => [s.x1Mm, s.x2Mm]);
-    const ys = clusterSegs.flatMap((s) => [s.y1Mm, s.y2Mm]);
-    const wMm = Math.max(1, Math.max(...xs) - Math.min(...xs));
-    const hMm = Math.max(1, Math.max(...ys) - Math.min(...ys));
+    let minX = Infinity;
+    let maxX = -Infinity;
+    let minY = Infinity;
+    let maxY = -Infinity;
+    for (let i = 0; i < clusterSegs.length; i++) {
+      const s = clusterSegs[i];
+      if (s.x1Mm < minX) minX = s.x1Mm;
+      if (s.x2Mm < minX) minX = s.x2Mm;
+      if (s.x1Mm > maxX) maxX = s.x1Mm;
+      if (s.x2Mm > maxX) maxX = s.x2Mm;
+      if (s.y1Mm < minY) minY = s.y1Mm;
+      if (s.y2Mm < minY) minY = s.y2Mm;
+      if (s.y1Mm > maxY) maxY = s.y1Mm;
+      if (s.y2Mm > maxY) maxY = s.y2Mm;
+    }
+    const wMm = Math.max(1, maxX - minX);
+    const hMm = Math.max(1, maxY - minY);
     const aspect = wMm / hMm;
     const hasCenterlines = clusterSegs.some((s) => s.layerHint === 'centerline');
     const numericDimTokens = tokens.filter((t) => /^\d{2,4}(?:\.\d+)?$/.test(t.trim()));
 
-    if (normBounds.y < 0.35 && numericDimTokens.length === 0 && clusterSegs.length >= 25) {
+    const hasTrueCircle = (() => {
+      const bySid = new Map<number, RawNormalizedSegment[]>();
+      for (let i = 0; i < clusterSegs.length; i++) {
+        const s = clusterSegs[i];
+        if (!s.subpathId || s.layerHint === 'dimension') continue;
+        const arr = bySid.get(s.subpathId);
+        if (arr) arr.push(s);
+        else bySid.set(s.subpathId, [s]);
+      }
+      for (const bucket of bySid.values()) {
+        if (isClosedCircleCandidate(bucket, 0.02)) return true;
+      }
+      return false;
+    })();
+
+    let outlineCount = 0;
+    let diagOutlineCount = 0;
+    for (let i = 0; i < clusterSegs.length; i++) {
+      const s = clusterSegs[i];
+      if (s.layerHint === 'dimension' || s.layerHint === 'centerline') continue;
+      const dx = Math.abs(s.x2Mm - s.x1Mm);
+      const dy = Math.abs(s.y2Mm - s.y1Mm);
+      const len = Math.hypot(dx, dy);
+      if (len < 0.1) continue;
+      outlineCount++;
+      // Diagonal if > ~6 degrees off both X and Y axes
+      if (dx > len * 0.105 && dy > len * 0.105) {
+        diagOutlineCount++;
+      }
+    }
+    const diagFrac = outlineCount > 0 ? diagOutlineCount / outlineCount : 0;
+
+    if (
+      normBounds.y < 0.35 &&
+      clusterSegs.length >= 25 &&
+      (numericDimTokens.length === 0 || (!hasTrueCircle && diagFrac >= 0.45))
+    ) {
       return { viewKind: 'isometric', label: 'Isometric 3D View' };
     }
-    if (aspect >= 0.78 && aspect <= 1.28 && (hasCenterlines || clusterSegs.length >= 40)) {
+    if (aspect >= 0.78 && aspect <= 1.28 && (hasCenterlines || hasTrueCircle || clusterSegs.length >= 40)) {
       return { viewKind: 'cross-section', label: 'End / Cross-Section View' };
     }
   }
@@ -1647,8 +2557,11 @@ function classifyViewFromFeatures(
 
 const VIEW_MERGE_GAP_MM = 8;
 const MAX_VIEW_GRID_DIM = 192;
+const SMALL_ENCLOSURE_AREA_RATIO = 0.03;
+const MIN_CLUSTER_BRIDGE_MM = 0.5;
+const ROW_BAND_CENTER_TOLERANCE = 0.14;
 
-function inferSheetSizeMm(segments: RawNormalizedSegment[]): { width: number; height: number } {
+export function inferSheetSizeMm(segments: RawNormalizedSegment[]): { width: number; height: number } {
   let sumDxMm = 0;
   let sumDnx = 0;
   let sumDyMm = 0;
@@ -1676,11 +2589,139 @@ function inferSheetSizeMm(segments: RawNormalizedSegment[]): { width: number; he
   };
 }
 
+function forEachLineGridCell(
+  x0: number,
+  y0: number,
+  x1: number,
+  y1: number,
+  cellW: number,
+  cellH: number,
+  cols: number,
+  rows: number,
+  visit: (cellIdx: number, c: number, r: number, cx1: number, cy1: number, cx2: number, cy2: number) => void
+): void {
+  const gx0 = Math.max(0, Math.min(cols - 1e-6, x0 / cellW));
+  const gy0 = Math.max(0, Math.min(rows - 1e-6, y0 / cellH));
+  const gx1 = Math.max(0, Math.min(cols - 1e-6, x1 / cellW));
+  const gy1 = Math.max(0, Math.min(rows - 1e-6, y1 / cellH));
+
+  let c = Math.max(0, Math.min(cols - 1, Math.floor(gx0)));
+  let r = Math.max(0, Math.min(rows - 1, Math.floor(gy0)));
+  const cEnd = Math.max(0, Math.min(cols - 1, Math.floor(gx1)));
+  const rEnd = Math.max(0, Math.min(rows - 1, Math.floor(gy1)));
+
+  if (c === cEnd && r === rEnd) {
+    visit(
+      r * cols + c,
+      c,
+      r,
+      x0 < x1 ? x0 : x1,
+      y0 < y1 ? y0 : y1,
+      x0 > x1 ? x0 : x1,
+      y0 > y1 ? y0 : y1
+    );
+    return;
+  }
+
+  const dgx = gx1 - gx0;
+  const dgy = gy1 - gy0;
+  const stepC = cEnd > c ? 1 : cEnd < c ? -1 : 0;
+  const stepR = rEnd > r ? 1 : rEnd < r ? -1 : 0;
+  const tDeltaC = stepC !== 0 && dgx !== 0 ? Math.abs(1 / dgx) : Infinity;
+  const tDeltaR = stepR !== 0 && dgy !== 0 ? Math.abs(1 / dgy) : Infinity;
+  let tMaxC =
+    stepC > 0 ? Math.max(0, (c + 1 - gx0) / dgx) : stepC < 0 ? Math.max(0, (c - gx0) / dgx) : Infinity;
+  let tMaxR =
+    stepR > 0 ? Math.max(0, (r + 1 - gy0) / dgy) : stepR < 0 ? Math.max(0, (r - gy0) / dgy) : Infinity;
+
+  let ax = x0;
+  let ay = y0;
+  const maxSteps = Math.abs(cEnd - c) + Math.abs(rEnd - r) + 4;
+
+  for (let step = 0; step < maxSteps; step++) {
+    const hitEnd = c === cEnd && r === rEnd;
+    const tNext = hitEnd ? 1 : Math.min(1, tMaxC, tMaxR);
+    const bx = x0 + (x1 - x0) * tNext;
+    const by = y0 + (y1 - y0) * tNext;
+
+    visit(
+      r * cols + c,
+      c,
+      r,
+      ax < bx ? ax : bx,
+      ay < by ? ay : by,
+      ax > bx ? ax : bx,
+      ay > by ? ay : by
+    );
+
+    if (hitEnd || tNext >= 1 - 1e-9) {
+      break;
+    }
+
+    if (Math.abs(tMaxC - tMaxR) <= 1e-9 && stepC !== 0 && stepR !== 0) {
+      const nc = c + stepC;
+      const nr = r + stepR;
+      if (nc >= 0 && nc < cols) visit(r * cols + nc, nc, r, bx, by, bx, by);
+      if (nr >= 0 && nr < rows) visit(nr * cols + c, c, nr, bx, by, bx, by);
+      c = Math.max(0, Math.min(cols - 1, nc));
+      r = Math.max(0, Math.min(rows - 1, nr));
+      tMaxC += tDeltaC;
+      tMaxR += tDeltaR;
+    } else if (tMaxC <= tMaxR && c !== cEnd) {
+      c = Math.max(0, Math.min(cols - 1, c + stepC));
+      tMaxC += tDeltaC;
+    } else if (r !== rEnd) {
+      r = Math.max(0, Math.min(rows - 1, r + stepR));
+      tMaxR += tDeltaR;
+    } else if (c !== cEnd) {
+      c = Math.max(0, Math.min(cols - 1, c + stepC));
+      tMaxC += tDeltaC;
+    } else {
+      break;
+    }
+
+    ax = bx;
+    ay = by;
+  }
+}
+
+function sortClustersInReadingOrder<T extends { x1: number; y1: number; x2: number; y2: number }>(
+  clusters: T[]
+): T[] {
+  if (clusters.length <= 1) return clusters;
+  const items = clusters.map((cluster) => ({
+    cluster,
+    cx: (cluster.x1 + cluster.x2) / 2,
+    cy: (cluster.y1 + cluster.y2) / 2,
+  }));
+  items.sort((a, b) => a.cy - b.cy);
+
+  const bands: Array<{ anchorCy: number; entries: typeof items }> = [];
+  for (const entry of items) {
+    const curBand = bands[bands.length - 1];
+    if (!curBand || entry.cy - curBand.anchorCy > ROW_BAND_CENTER_TOLERANCE) {
+      bands.push({ anchorCy: entry.cy, entries: [entry] });
+    } else {
+      curBand.entries.push(entry);
+    }
+  }
+
+  bands.sort((a, b) => a.anchorCy - b.anchorCy);
+  const ordered: T[] = [];
+  for (const band of bands) {
+    band.entries.sort((a, b) => a.cx - b.cx || a.cluster.x1 - b.cluster.x1);
+    for (const entry of band.entries) {
+      ordered.push(entry.cluster);
+    }
+  }
+  return ordered;
+}
+
 export function detectViewRegions(
   segments: RawNormalizedSegment[],
   textItems: RawNormalizedText[],
   titleBlockTopNy: number,
-  sheetSizeMm: { width: number; height: number } | undefined = undefined
+  sheetSizeMm: { width: number; height: number }
 ): Array<{ normBounds: NormalizedRect; viewKind: ViewChunkKind; label: string }> {
   const structuralIndices: number[] = [];
   for (let i = 0; i < segments.length; i++) {
@@ -1702,9 +2743,8 @@ export function detectViewRegions(
     ];
   }
 
-  const resolvedSize = sheetSizeMm ?? inferSheetSizeMm(segments);
-  const gapX = Math.max(0.004, Math.min(0.15, VIEW_MERGE_GAP_MM / Math.max(1, resolvedSize.width)));
-  const gapY = Math.max(0.004, Math.min(0.15, VIEW_MERGE_GAP_MM / Math.max(1, resolvedSize.height)));
+  const gapX = Math.max(0.004, Math.min(0.15, VIEW_MERGE_GAP_MM / Math.max(1, sheetSizeMm.width)));
+  const gapY = Math.max(0.004, Math.min(0.15, VIEW_MERGE_GAP_MM / Math.max(1, sheetSizeMm.height)));
 
   const cellW = Math.max(gapX, 1 / MAX_VIEW_GRID_DIM);
   const cellH = Math.max(gapY, 1 / MAX_VIEW_GRID_DIM);
@@ -1719,16 +2759,19 @@ export function detectViewRegions(
   const maxX = new Float32Array(n);
   const maxY = new Float32Array(n);
   const lenSum = new Float32Array(n);
+  const isBridge = new Uint8Array(n);
 
   for (let i = 0; i < n; i++) {
     const s = segments[useStructural ? structuralIndices[i] : i];
+    const segLenMm = Math.hypot(s.x2Mm - s.x1Mm, s.y2Mm - s.y1Mm);
     parent[i] = i;
     size[i] = 1;
     minX[i] = s.nx1 < s.nx2 ? s.nx1 : s.nx2;
     minY[i] = s.ny1 < s.ny2 ? s.ny1 : s.ny2;
     maxX[i] = s.nx1 > s.nx2 ? s.nx1 : s.nx2;
     maxY[i] = s.ny1 > s.ny2 ? s.ny1 : s.ny2;
-    lenSum[i] = Math.hypot(s.x2Mm - s.x1Mm, s.y2Mm - s.y1Mm);
+    lenSum[i] = segLenMm;
+    isBridge[i] = segLenMm >= MIN_CLUSTER_BRIDGE_MM ? 1 : 0;
   }
 
   const find = (x: number): number => {
@@ -1765,44 +2808,25 @@ export function detectViewRegions(
   const cellMaxX = new Float32Array(gridSize).fill(-Infinity);
   const cellMaxY = new Float32Array(gridSize).fill(-Infinity);
 
-  // Uniform grid pass: segments sharing a (gapX x gapY) cell are within (gapX, gapY)
+  // Uniform grid pass: walk only the cells each bridge-eligible segment (>= MIN_CLUSTER_BRIDGE_MM) crosses
   for (let i = 0; i < n; i++) {
-    const sx1 = minX[i];
-    const sy1 = minY[i];
-    const sx2 = maxX[i];
-    const sy2 = maxY[i];
-    const c1 = Math.min(cols - 1, Math.max(0, Math.floor(sx1 / cellW)));
-    const c2 = Math.min(cols - 1, Math.max(0, Math.floor(sx2 / cellW)));
-    const r1 = Math.min(rows - 1, Math.max(0, Math.floor(sy1 / cellH)));
-    const r2 = Math.min(rows - 1, Math.max(0, Math.floor(sy2 / cellH)));
-
-    for (let r = r1; r <= r2; r++) {
-      const rowBase = r * cols;
-      const cellY0 = r * cellH;
-      const cellY1 = cellY0 + cellH;
-      const cy1 = sy1 > cellY0 ? sy1 : cellY0;
-      const cy2 = sy2 < cellY1 ? sy2 : cellY1;
-      for (let c = c1; c <= c2; c++) {
-        const cellIdx = rowBase + c;
-        const cellX0 = c * cellW;
-        const cellX1 = cellX0 + cellW;
-        const cx1 = sx1 > cellX0 ? sx1 : cellX0;
-        const cx2 = sx2 < cellX1 ? sx2 : cellX1;
-        if (cx1 < cellMinX[cellIdx]) cellMinX[cellIdx] = cx1;
-        if (cx2 > cellMaxX[cellIdx]) cellMaxX[cellIdx] = cx2;
-        if (cy1 < cellMinY[cellIdx]) cellMinY[cellIdx] = cy1;
-        if (cy2 > cellMaxY[cellIdx]) cellMaxY[cellIdx] = cy2;
-        const rep = cellRep[cellIdx];
-        if (rep === -1) {
-          cellRep[cellIdx] = i;
-        } else {
-          union(i, rep);
-        }
+    if (!isBridge[i]) continue;
+    const s = segments[useStructural ? structuralIndices[i] : i];
+    forEachLineGridCell(s.nx1, s.ny1, s.nx2, s.ny2, cellW, cellH, cols, rows, (cellIdx, _c, _r, cx1, cy1, cx2, cy2) => {
+      if (cx1 < cellMinX[cellIdx]) cellMinX[cellIdx] = cx1;
+      if (cx2 > cellMaxX[cellIdx]) cellMaxX[cellIdx] = cx2;
+      if (cy1 < cellMinY[cellIdx]) cellMinY[cellIdx] = cy1;
+      if (cy2 > cellMaxY[cellIdx]) cellMaxY[cellIdx] = cy2;
+      const rep = cellRep[cellIdx];
+      if (rep === -1) {
+        cellRep[cellIdx] = i;
+      } else {
+        union(i, rep);
       }
-    }
+    });
   }
 
-  // Forward-neighbor pass catches pairs within (gapX, gapY) across cell boundaries without quantization overshoot
+  // Forward-neighbor pass catches bridge-eligible pairs within (gapX, gapY) across cell boundaries
   const neighborOffsets: Array<[number, number]> = [
     [1, 0],
     [0, 1],
@@ -1836,32 +2860,177 @@ export function detectViewRegions(
     }
   }
 
-  // Sweep-and-prune pass merges isolated interior features (e.g. concentric holes) enclosed in outer view bboxes
+  // Attach sub-threshold segments (< MIN_CLUSTER_BRIDGE_MM) to at most one directly touched cluster; never bridge clusters
+  for (let i = 0; i < n; i++) {
+    if (isBridge[i]) continue;
+    const s = segments[useStructural ? structuralIndices[i] : i];
+    const sx1 = minX[i];
+    const sy1 = minY[i];
+    const sx2 = maxX[i];
+    const sy2 = maxY[i];
+    let attachedRoot = -1;
+    forEachLineGridCell(s.nx1, s.ny1, s.nx2, s.ny2, cellW, cellH, cols, rows, (cellIdx) => {
+      if (attachedRoot !== -1) return;
+      const rep = cellRep[cellIdx];
+      if (rep === -1) return;
+      if (
+        !(
+          sx2 + gapX * 0.25 < cellMinX[cellIdx] ||
+          cellMaxX[cellIdx] + gapX * 0.25 < sx1 ||
+          sy2 + gapY * 0.25 < cellMinY[cellIdx] ||
+          cellMaxY[cellIdx] + gapY * 0.25 < sy1
+        )
+      ) {
+        attachedRoot = find(rep);
+      }
+    });
+    if (attachedRoot !== -1) {
+      parent[i] = attachedRoot;
+      size[attachedRoot] += 1;
+      lenSum[attachedRoot] += lenSum[i];
+    }
+  }
+
+  // Lazy index of closed outline subpaths per cluster root, built only if an enclosed cluster >= SMALL_ENCLOSURE_AREA_RATIO appears
+  let rootOutlineCache: Map<number, RawNormalizedSegment[]> | null = null;
+  const getRootOutlineCache = (): Map<number, RawNormalizedSegment[]> => {
+    if (!rootOutlineCache) {
+      rootOutlineCache = new Map<number, RawNormalizedSegment[]>();
+      for (let idx = 0; idx < n; idx++) {
+        const s = segments[useStructural ? structuralIndices[idx] : idx];
+        if (s.layerHint && s.layerHint !== 'outline') continue;
+        const r = find(idx);
+        const list = rootOutlineCache.get(r);
+        if (list) list.push(s);
+        else rootOutlineCache.set(r, [s]);
+      }
+    }
+    return rootOutlineCache;
+  };
+  const isClosedLoop = (bucket: RawNormalizedSegment[]): boolean => {
+    if (bucket.length < 3) return false;
+    const first = bucket[0];
+    const last = bucket[bucket.length - 1];
+    return Math.hypot(first.nx1 - last.nx2, first.ny1 - last.ny2) <= 2e-3;
+  };
+  const isPointInBucket = (qx: number, qy: number, segs: RawNormalizedSegment[]): boolean => {
+    let crossRight = 0;
+    let crossLeft = 0;
+    let crossDown = 0;
+    let crossUp = 0;
+    for (let k = 0; k < segs.length; k++) {
+      const s = segs[k];
+      if ((s.ny1 > qy) !== (s.ny2 > qy)) {
+        const xInt = s.nx1 + ((qy - s.ny1) * (s.nx2 - s.nx1)) / (s.ny2 - s.ny1);
+        if (xInt > qx) crossRight++;
+        else crossLeft++;
+      }
+      if ((s.nx1 > qx) !== (s.nx2 > qx)) {
+        const yInt = s.ny1 + ((qx - s.nx1) * (s.ny2 - s.ny1)) / (s.nx2 - s.nx1);
+        if (yInt > qy) crossDown++;
+        else crossUp++;
+      }
+    }
+    return (
+      (crossRight & 1) === 1 &&
+      (crossLeft & 1) === 1 &&
+      (crossDown & 1) === 1 &&
+      (crossUp & 1) === 1
+    );
+  };
+  const isInsideClusterOutline = (px: number, py: number, root: number): boolean => {
+    const segs = getRootOutlineCache().get(root);
+    if (!segs || segs.length < 3) return false;
+    const bySubpath = new Map<number, RawNormalizedSegment[]>();
+    const unkeyed: RawNormalizedSegment[] = [];
+    for (let k = 0; k < segs.length; k++) {
+      const s = segs[k];
+      if (s.subpathId && s.subpathId > 0) {
+        const b = bySubpath.get(s.subpathId);
+        if (b) b.push(s);
+        else bySubpath.set(s.subpathId, [s]);
+      } else {
+        unkeyed.push(s);
+      }
+    }
+    // Slight asymmetric offset avoids landing exactly on horizontal/vertical vertices
+    const qx = px + 1.37e-5;
+    const qy = py + 1.73e-5;
+    for (const bucket of bySubpath.values()) {
+      if (isClosedLoop(bucket) && isPointInBucket(qx, qy, bucket)) {
+        return true;
+      }
+    }
+    if (unkeyed.length >= 3 && isPointInBucket(qx, qy, unkeyed)) {
+      return true;
+    }
+    return false;
+  };
+
+  // Sweep-and-prune pass merges small enclosed sub-clusters (< 3% bbox area) or internal features inside a solid closed outline
   const rawRoots: number[] = [];
   for (let i = 0; i < n; i++) {
     if (parent[i] === i) rawRoots.push(i);
   }
-  let sweepMerged = true;
-  let activeRoots = rawRoots;
-  while (sweepMerged && activeRoots.length > 1) {
-    sweepMerged = false;
-    activeRoots.sort((a, b) => minX[a] - minX[b]);
-    const nextRoots: number[] = [];
-    for (let idx = 0; idx < activeRoots.length; idx++) {
-      let cur = find(activeRoots[idx]);
-      if (cur !== activeRoots[idx]) continue;
-      for (let j = idx + 1; j < activeRoots.length; j++) {
-        const other = find(activeRoots[j]);
-        if (other === cur) continue;
-        if (minX[other] > maxX[cur] + gapX) break;
-        if (!(maxY[cur] + gapY < minY[other] || maxY[other] + gapY < minY[cur])) {
+  rawRoots.sort((a, b) => {
+    if (minX[a] !== minX[b]) return minX[a] - minX[b];
+    const areaA = (maxX[a] - minX[a]) * (maxY[a] - minY[a]);
+    const areaB = (maxX[b] - minX[b]) * (maxY[b] - minY[b]);
+    return areaB - areaA;
+  });
+
+  const absorbed = new Uint8Array(rawRoots.length);
+  const activeRoots: number[] = [];
+  for (let i = 0; i < rawRoots.length; i++) {
+    if (absorbed[i]) continue;
+    let cur = find(rawRoots[i]);
+    const curX1 = minX[cur];
+    const curY1 = minY[cur];
+    const curX2 = maxX[cur];
+    const curY2 = maxY[cur];
+    const curArea = (curX2 - curX1) * (curY2 - curY1);
+
+    if (curArea > 0) {
+      for (let j = i + 1; j < rawRoots.length; j++) {
+        if (absorbed[j]) continue;
+        const other = find(rawRoots[j]);
+        if (other === cur) {
+          absorbed[j] = 1;
+          continue;
+        }
+        if (minX[other] > curX2 + 1e-6) break;
+        const ox1 = minX[other];
+        const oy1 = minY[other];
+        const ox2 = maxX[other];
+        const oy2 = maxY[other];
+        const oArea = (ox2 - ox1) * (oy2 - oy1);
+        if (
+          ox1 >= curX1 - 1e-6 &&
+          ox2 <= curX2 + 1e-6 &&
+          oy1 >= curY1 - 1e-6 &&
+          oy2 <= curY2 + 1e-6 &&
+          (oArea < SMALL_ENCLOSURE_AREA_RATIO * curArea ||
+            isInsideClusterOutline((ox1 + ox2) * 0.5, (oy1 + oy2) * 0.5, cur))
+        ) {
+          const prevCur = cur;
           cur = union(cur, other);
-          sweepMerged = true;
+          if (rootOutlineCache !== null) {
+            const cache = getRootOutlineCache();
+            const absorbedRoot = cur === prevCur ? other : prevCur;
+            const keepList = cache.get(cur);
+            const moveList = cache.get(absorbedRoot);
+            if (keepList && moveList) {
+              for (let m = 0; m < moveList.length; m++) keepList.push(moveList[m]);
+            } else if (moveList) {
+              cache.set(cur, moveList);
+            }
+            cache.delete(absorbedRoot);
+          }
+          absorbed[j] = 1;
         }
       }
-      nextRoots.push(cur);
     }
-    activeRoots = nextRoots;
+    activeRoots.push(cur);
   }
 
   interface ClusterSummary {
@@ -1912,9 +3081,7 @@ export function detectViewRegions(
     return b.lenSum - a.lenSum;
   });
 
-  const significant = significantAll
-    .slice(0, 6)
-    .sort((a, b) => (Math.abs(a.y1 - b.y1) > 0.14 ? a.y1 - b.y1 : a.x1 - b.x1));
+  const significant = sortClustersInReadingOrder(significantAll.slice(0, 6));
 
   const rootToSelected = new Map<number, number>();
   const clusterSegBuckets: RawNormalizedSegment[][] = significant.map((c, idx) => {
@@ -2048,16 +3215,13 @@ function buildViewChunksWithStats(
     const cx = (minX + maxX) / 2;
     const cy = (minY + maxY) / 2;
 
-    const vectorEntities: CadEntity[] = enclosedSegs.map((s, sIdx) => ({
-      id: `${id}-vec-${sIdx + 1}`,
+    const vectorEntities = recoverPrimitivesFromSegments(enclosedSegs, {
+      idPrefix: `${id}-vec`,
       viewId: id,
-      layer: s.layerHint || 'outline',
-      type: 'line',
-      x1: Number((s.x1Mm - cx).toFixed(3)),
-      y1: Number((s.y1Mm - cy).toFixed(3)),
-      x2: Number((s.x2Mm - cx).toFixed(3)),
-      y2: Number((s.y2Mm - cy).toFixed(3)),
-    }));
+      offsetX: -cx,
+      offsetY: -cy,
+      scaleFactor,
+    });
 
     return {
       id,
@@ -2109,14 +3273,38 @@ export function buildViewChunksFromSpecs(
   ).chunks;
 }
 
-function extractNumericDimCallouts(tokens: string[]): number[] {
+export function extractNumericDimCallouts(
+  tokens: string[],
+  opts: { excludeTolerances?: boolean } = {}
+): number[] {
   const vals: number[] = [];
+  const parsePartPieces = (rawPart: string, isTolerance: boolean) => {
+    const pieces = rawPart.replace(/(\d)\s*[x×]\s*(?=[ØøRrMm]?\s*\d)/gi, '$1\0').split('\0');
+    for (const piece of pieces) {
+      const cleaned = piece.replace(/^[ØøRrMm+\s]+|[°"'\s]+$/g, '').trim();
+      if (/^\d{1,4}(?:\.\d+)?$/.test(cleaned)) {
+        const n = Number(cleaned);
+        if (Number.isFinite(n) && (isTolerance ? n > 0 : n >= 1) && n <= 10000) {
+          vals.push(n);
+        }
+      }
+    }
+  };
+
   for (const tok of tokens) {
-    const cleaned = tok.replace(/[ØøRr±]/g, '').trim();
-    if (/^\d{1,4}(?:\.\d+)?$/.test(cleaned)) {
-      const n = Number(cleaned);
-      if (Number.isFinite(n) && n >= 1 && n <= 10000) {
-        vals.push(n);
+    const trimmed = tok.trim();
+    if (!trimmed) continue;
+    // Skip scale ratios like "1:20"
+    if (/^\d+(?:\.\d+)?\s*:\s*\d+(?:\.\d+)?$/.test(trimmed)) continue;
+    const tolSplit = trimmed.split(/(?:\+\s*\/\s*-|±)/);
+    if (tolSplit[0].trim().length > 0) {
+      parsePartPieces(tolSplit[0], false);
+    }
+    if (!opts.excludeTolerances && tolSplit.length > 1) {
+      for (let i = 1; i < tolSplit.length; i++) {
+        if (tolSplit[i].trim().length > 0) {
+          parsePartPieces(tolSplit[i], true);
+        }
       }
     }
   }
@@ -2131,7 +3319,9 @@ export function calibrateScaleFromViewChunks(
   const candidateRatios: number[] = [];
 
   for (const chunk of nonIso) {
-    const dims = extractNumericDimCallouts(chunk.extractedText).filter((d) => d >= 15);
+    const dims = extractNumericDimCallouts(chunk.extractedText, { excludeTolerances: true }).filter(
+      (d) => d >= 15
+    );
     if (dims.length === 0) continue;
     const wPaper = chunk.boundingBox.maxX - chunk.boundingBox.minX;
     const hPaper = chunk.boundingBox.maxY - chunk.boundingBox.minY;
@@ -2139,12 +3329,25 @@ export function calibrateScaleFromViewChunks(
     const minPaper = Math.min(wPaper, hPaper);
     if (maxPaper < 4) continue;
 
-    const rMax = dims[0] / maxPaper;
+    // Prefer exact outer recovered circle diameters when they dominate the view bounding box
+    const circleDias: number[] = [];
+    for (const ent of chunk.vectorEntities) {
+      if (ent.type === 'circle' && ent.layer !== 'dimension' && ent.r > 0) {
+        circleDias.push(ent.r * 2);
+      }
+    }
+    circleDias.sort((a, b) => b - a);
+    const useCircleRefs = circleDias.length > 0 && circleDias[0] >= maxPaper * 0.85;
+    const primaryPaper = useCircleRefs ? circleDias[0] : maxPaper;
+    const secondaryPaper =
+      useCircleRefs && circleDias.length >= 2 ? circleDias[1] : minPaper;
+
+    const rMax = dims[0] / primaryPaper;
     if (rMax >= 0.4 && rMax <= 200) {
       candidateRatios.push(rMax);
     }
-    if (dims.length >= 2 && minPaper >= 4) {
-      const rMin = dims[1] / minPaper;
+    if (dims.length >= 2 && secondaryPaper >= 4) {
+      const rMin = dims[1] / secondaryPaper;
       if (rMin >= 0.4 && rMin <= 200 && Math.abs(rMin - rMax) / Math.max(rMax, 0.001) < 0.06) {
         candidateRatios.push(rMin);
       }
@@ -2284,6 +3487,139 @@ export function buildRawVectorAnalysis(
   let stockW = 20;
   let stockH = 20;
 
+  const scaleNum = (n: number) => Number((n * scaleFactor).toFixed(2));
+  const placeScaledEntity = (
+    ent: CadEntity,
+    dx: number,
+    dy: number,
+    viewId?: string,
+    featureId?: string
+  ): CadEntity => {
+    const common = {
+      id: ent.id,
+      layer: ent.layer,
+      ...(ent.source ? { source: ent.source } : {}),
+      ...(viewId ? { viewId } : ent.viewId ? { viewId: ent.viewId } : {}),
+      ...(featureId ? { featureId } : ent.featureId ? { featureId: ent.featureId } : {}),
+    };
+    if (ent.type === 'line') {
+      return {
+        ...common,
+        type: 'line',
+        x1: Number((ent.x1 * scaleFactor + dx).toFixed(2)),
+        y1: Number((ent.y1 * scaleFactor + dy).toFixed(2)),
+        x2: Number((ent.x2 * scaleFactor + dx).toFixed(2)),
+        y2: Number((ent.y2 * scaleFactor + dy).toFixed(2)),
+      };
+    }
+    if (ent.type === 'circle') {
+      return {
+        ...common,
+        type: 'circle',
+        cx: Number((ent.cx * scaleFactor + dx).toFixed(2)),
+        cy: Number((ent.cy * scaleFactor + dy).toFixed(2)),
+        r: scaleNum(ent.r),
+      };
+    }
+    if (ent.type === 'arc') {
+      return {
+        ...common,
+        type: 'arc',
+        cx: Number((ent.cx * scaleFactor + dx).toFixed(2)),
+        cy: Number((ent.cy * scaleFactor + dy).toFixed(2)),
+        r: scaleNum(ent.r),
+        startAngle: ent.startAngle,
+        endAngle: ent.endAngle,
+      };
+    }
+    if (ent.type === 'rect') {
+      return {
+        ...common,
+        type: 'rect',
+        x: Number((ent.x * scaleFactor + dx).toFixed(2)),
+        y: Number((ent.y * scaleFactor + dy).toFixed(2)),
+        width: scaleNum(ent.width),
+        height: scaleNum(ent.height),
+        ...(ent.rx !== undefined ? { rx: scaleNum(ent.rx) } : {}),
+      };
+    }
+    return {
+      ...common,
+      type: 'polyline',
+      points: ent.points.map((p) => ({
+        x: Number((p.x * scaleFactor + dx).toFixed(2)),
+        y: Number((p.y * scaleFactor + dy).toFixed(2)),
+      })),
+      ...(ent.closed !== undefined ? { closed: ent.closed } : {}),
+    };
+  };
+
+  const getEntityBounds = (
+    ent: CadEntity
+  ): { minX: number; minY: number; maxX: number; maxY: number } | null => {
+    if (ent.type === 'line') {
+      return {
+        minX: Math.min(ent.x1, ent.x2),
+        minY: Math.min(ent.y1, ent.y2),
+        maxX: Math.max(ent.x1, ent.x2),
+        maxY: Math.max(ent.y1, ent.y2),
+      };
+    }
+    if (ent.type === 'circle') {
+      return {
+        minX: ent.cx - ent.r,
+        minY: ent.cy - ent.r,
+        maxX: ent.cx + ent.r,
+        maxY: ent.cy + ent.r,
+      };
+    }
+    if (ent.type === 'arc') {
+      const a0 = (ent.startAngle * Math.PI) / 180;
+      const a1 = (ent.endAngle * Math.PI) / 180;
+      const x0 = ent.cx + ent.r * Math.cos(a0);
+      const y0 = ent.cy + ent.r * Math.sin(a0);
+      const x1 = ent.cx + ent.r * Math.cos(a1);
+      const y1 = ent.cy + ent.r * Math.sin(a1);
+      let bMinX = Math.min(x0, x1);
+      let bMaxX = Math.max(x0, x1);
+      let bMinY = Math.min(y0, y1);
+      let bMaxY = Math.max(y0, y1);
+      const normA = (deg: number) => ((deg % 360) + 360) % 360;
+      const sDeg = normA(ent.startAngle);
+      let sweepDeg = normA(ent.endAngle - ent.startAngle);
+      if (sweepDeg === 0 && ent.endAngle !== ent.startAngle) sweepDeg = 360;
+      const hasDeg = (d: number) => normA(d - sDeg) <= sweepDeg + 1e-6;
+      if (hasDeg(0)) bMaxX = ent.cx + ent.r;
+      if (hasDeg(90)) bMaxY = ent.cy + ent.r;
+      if (hasDeg(180)) bMinX = ent.cx - ent.r;
+      if (hasDeg(270)) bMinY = ent.cy - ent.r;
+      return { minX: bMinX, minY: bMinY, maxX: bMaxX, maxY: bMaxY };
+    }
+    if (ent.type === 'rect') {
+      return {
+        minX: ent.x,
+        minY: ent.y,
+        maxX: ent.x + ent.width,
+        maxY: ent.y + ent.height,
+      };
+    }
+    if (ent.type === 'polyline' && ent.points.length > 0) {
+      let bMinX = Infinity;
+      let bMinY = Infinity;
+      let bMaxX = -Infinity;
+      let bMaxY = -Infinity;
+      for (let i = 0; i < ent.points.length; i++) {
+        const p = ent.points[i];
+        if (p.x < bMinX) bMinX = p.x;
+        if (p.y < bMinY) bMinY = p.y;
+        if (p.x > bMaxX) bMaxX = p.x;
+        if (p.y > bMaxY) bMaxY = p.y;
+      }
+      return { minX: bMinX, minY: bMinY, maxX: bMaxX, maxY: bMaxY };
+    }
+    return null;
+  };
+
   if (isMultiView) {
     for (const chunk of payload.viewChunks) {
       const featId = `feat-${chunk.id}`;
@@ -2299,30 +3635,23 @@ export function buildRawVectorAnalysis(
       let cMaxY = -Infinity;
 
       for (const ent of chunk.vectorEntities) {
-        if (ent.type !== 'line') continue;
-        const placed: CadEntity = {
-          ...ent,
-          viewId: chunk.id,
-          featureId: featId,
-          x1: Number((ent.x1 * scaleFactor + dx).toFixed(2)),
-          y1: Number((ent.y1 * scaleFactor + dy).toFixed(2)),
-          x2: Number((ent.x2 * scaleFactor + dx).toFixed(2)),
-          y2: Number((ent.y2 * scaleFactor + dy).toFixed(2)),
-        };
+        const placed = placeScaledEntity(ent, dx, dy, chunk.id, featId);
         entities.push(placed);
+        const eb = getEntityBounds(placed);
+        if (!eb) continue;
         const countsTowardBounds = chunkHasOutlines
           ? placed.layer === 'outline' || placed.layer === 'hidden'
           : placed.layer !== 'dimension';
         if (countsTowardBounds) {
-          cMinX = Math.min(cMinX, placed.x1, placed.x2);
-          cMinY = Math.min(cMinY, placed.y1, placed.y2);
-          cMaxX = Math.max(cMaxX, placed.x1, placed.x2);
-          cMaxY = Math.max(cMaxY, placed.y1, placed.y2);
+          cMinX = Math.min(cMinX, eb.minX);
+          cMinY = Math.min(cMinY, eb.minY);
+          cMaxX = Math.max(cMaxX, eb.maxX);
+          cMaxY = Math.max(cMaxY, eb.maxY);
         }
-        minX = Math.min(minX, placed.x1, placed.x2);
-        minY = Math.min(minY, placed.y1, placed.y2);
-        maxX = Math.max(maxX, placed.x1, placed.x2);
-        maxY = Math.max(maxY, placed.y1, placed.y2);
+        minX = Math.min(minX, eb.minX);
+        minY = Math.min(minY, eb.minY);
+        maxX = Math.max(maxX, eb.maxX);
+        maxY = Math.max(maxY, eb.maxY);
       }
 
       if (!Number.isFinite(cMinX)) {
@@ -2339,7 +3668,7 @@ export function buildRawVectorAnalysis(
         stockH = Math.max(stockH, h);
       }
 
-      const callouts = extractNumericDimCallouts(chunk.extractedText);
+      const callouts = extractNumericDimCallouts(chunk.extractedText, { excludeTolerances: true });
       const calloutSuffix =
         callouts.length > 0 ? ` · Callouts: ${callouts.slice(0, 3).join(', ')} ${units}` : '';
 
@@ -2382,17 +3711,7 @@ export function buildRawVectorAnalysis(
     }
   } else {
     for (const ent of payload.vectorEntities) {
-      entities.push(
-        ent.type === 'line'
-          ? {
-              ...ent,
-              x1: Number((ent.x1 * scaleFactor).toFixed(2)),
-              y1: Number((ent.y1 * scaleFactor).toFixed(2)),
-              x2: Number((ent.x2 * scaleFactor).toFixed(2)),
-              y2: Number((ent.y2 * scaleFactor).toFixed(2)),
-            }
-          : ent
-      );
+      entities.push(placeScaledEntity(ent, 0, 0));
     }
     minX = Number((payload.vectorBoundingBox.minX * scaleFactor).toFixed(2));
     minY = Number((payload.vectorBoundingBox.minY * scaleFactor).toFixed(2));

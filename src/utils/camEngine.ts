@@ -511,6 +511,17 @@ export function exportToSvg(analysis: DrawingAnalysisResult): string {
       elements.push(`<line${layerAttr} x1="${ent.x1}" y1="${-ent.y1}" x2="${ent.x2}" y2="${-ent.y2}" stroke="${stroke}" stroke-width="${sw}"${dash} />`);
     } else if (ent.type === 'circle') {
       elements.push(`<circle${layerAttr} cx="${ent.cx}" cy="${-ent.cy}" r="${ent.r}" fill="none" stroke="${stroke}" stroke-width="${sw}"${dash} />`);
+    } else if (ent.type === 'arc') {
+      const rad0 = (ent.startAngle * Math.PI) / 180;
+      const rad1 = (ent.endAngle * Math.PI) / 180;
+      const x0 = ent.cx + ent.r * Math.cos(rad0);
+      const y0 = -(ent.cy + ent.r * Math.sin(rad0));
+      const x1 = ent.cx + ent.r * Math.cos(rad1);
+      const y1 = -(ent.cy + ent.r * Math.sin(rad1));
+      let sweep = ent.endAngle - ent.startAngle;
+      while (sweep < 0) sweep += 360;
+      const largeArc = sweep > 180 ? 1 : 0;
+      elements.push(`<path${layerAttr} d="M ${x0.toFixed(4)} ${y0.toFixed(4)} A ${ent.r} ${ent.r} 0 ${largeArc} 0 ${x1.toFixed(4)} ${y1.toFixed(4)}" fill="none" stroke="${stroke}" stroke-width="${sw}"${dash} />`);
     } else if (ent.type === 'rect') {
       elements.push(`<rect${layerAttr} x="${ent.x}" y="${-(ent.y + ent.height)}" width="${ent.width}" height="${ent.height}" rx="${ent.rx || 0}" fill="none" stroke="${stroke}" stroke-width="${sw}"${dash} />`);
     } else if (ent.type === 'polyline' && ent.points.length > 1) {

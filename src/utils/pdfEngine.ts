@@ -38,91 +38,149 @@ function cropDataUrlFromCanvas(
   return sub.toDataURL('image/png');
 }
 
+const MAX_CACHED_PDF_DOCS = 2;
+
+interface CachedPdfDocEntry {
+  loadingTask: pdfjsLib.PDFDocumentLoadingTask;
+  docPromise: Promise<pdfjsLib.PDFDocumentProxy>;
+}
+
+const pdfDocCache = new Map<ArrayBuffer, CachedPdfDocEntry>();
+
+function getCachedPdfDocument(pdfBytes: ArrayBuffer): Promise<pdfjsLib.PDFDocumentProxy> {
+  const existing = pdfDocCache.get(pdfBytes);
+  if (existing) {
+    // Refresh MRU order
+    pdfDocCache.delete(pdfBytes);
+    pdfDocCache.set(pdfBytes, existing);
+    return existing.docPromise;
+  }
+
+  while (pdfDocCache.size >= MAX_CACHED_PDF_DOCS) {
+    const oldestKey = pdfDocCache.keys().next().value;
+    if (!oldestKey) break;
+    const oldest = pdfDocCache.get(oldestKey);
+    pdfDocCache.delete(oldestKey);
+    if (oldest) {
+      void oldest.loadingTask.destroy().catch(() => {});
+    }
+  }
+
+  const loadingTask = pdfjsLib.getDocument({ data: pdfBytes.slice(0) });
+  const docPromise = loadingTask.promise.catch((err) => {
+    const cur = pdfDocCache.get(pdfBytes);
+    if (cur?.loadingTask === loadingTask) {
+      pdfDocCache.delete(pdfBytes);
+    }
+    void loadingTask.destroy().catch(() => {});
+    throw err;
+  });
+
+  pdfDocCache.set(pdfBytes, { loadingTask, docPromise });
+  return docPromise;
+}
+
+export async function clearPdfDocumentCache(pdfBytes?: ArrayBuffer): Promise<void> {
+  if (pdfBytes) {
+    const entry = pdfDocCache.get(pdfBytes);
+    if (!entry) return;
+    pdfDocCache.delete(pdfBytes);
+    await entry.loadingTask.destroy().catch(() => {});
+    return;
+  }
+  const entries = Array.from(pdfDocCache.values());
+  pdfDocCache.clear();
+  await Promise.all(entries.map((e) => e.loadingTask.destroy().catch(() => {})));
+}
+
 export async function extractPdfPage(
   pdfBytes: ArrayBuffer,
   fileName: string,
   pageNumber = 1
 ): Promise<PdfExtractionPayload> {
-  const loadingTask = pdfjsLib.getDocument({ data: pdfBytes.slice(0) });
-  const pdf = await loadingTask.promise;
+  const pdf = await getCachedPdfDocument(pdfBytes);
   const clampedPage = Math.max(1, Math.min(pageNumber, pdf.numPages));
   const page = await pdf.getPage(clampedPage);
 
-  const baseViewport = page.getViewport({ scale: 1 });
-  const maxDim = Math.max(baseViewport.width, baseViewport.height);
-  const renderScale = Math.min(2.6, Math.max(1.2, 1600 / maxDim));
-  const viewport = page.getViewport({ scale: renderScale });
+  try {
+    const baseViewport = page.getViewport({ scale: 1 });
+    const maxDim = Math.max(baseViewport.width, baseViewport.height);
+    const renderScale = Math.min(2.6, Math.max(1.2, 1600 / maxDim));
+    const viewport = page.getViewport({ scale: renderScale });
 
-  const canvas = document.createElement('canvas');
-  canvas.width = Math.round(viewport.width);
-  canvas.height = Math.round(viewport.height);
-  const ctx = canvas.getContext('2d');
-  if (!ctx) {
-    throw new Error('Could not initialize 2D canvas context for PDF rendering.');
-  }
-
-  ctx.fillStyle = '#ffffff';
-  ctx.fillRect(0, 0, canvas.width, canvas.height);
-
-  await page.render({
-    canvasContext: ctx,
-    viewport,
-    canvas,
-  }).promise;
-
-  const renderedImageDataUrl = canvas.toDataURL('image/png');
-
-  const textContent = await page.getTextContent();
-  const extractedText: string[] = [];
-  const rawNormalizedTextItems: RawNormalizedText[] = [];
-  for (const item of textContent.items) {
-    if ('str' in item && typeof item.str === 'string') {
-      const cleaned = item.str.trim();
-      if (!cleaned) continue;
-      extractedText.push(cleaned);
-      const tx = item.transform?.[4] ?? 0;
-      const ty = item.transform?.[5] ?? 0;
-      const [vx, vy] = viewport.convertToViewportPoint(tx, ty);
-      rawNormalizedTextItems.push({
-        text: cleaned,
-        nx: Math.max(0, Math.min(1, vx / viewport.width)),
-        ny: Math.max(0, Math.min(1, vy / viewport.height)),
-      });
+    const canvas = document.createElement('canvas');
+    canvas.width = Math.round(viewport.width);
+    canvas.height = Math.round(viewport.height);
+    const ctx = canvas.getContext('2d');
+    if (!ctx) {
+      throw new Error('Could not initialize 2D canvas context for PDF rendering.');
     }
+
+    ctx.fillStyle = '#ffffff';
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+    await page.render({
+      canvasContext: ctx,
+      viewport,
+      canvas,
+    }).promise;
+
+    const renderedImageDataUrl = canvas.toDataURL('image/png');
+
+    const textContent = await page.getTextContent();
+    const extractedText: string[] = [];
+    const rawNormalizedTextItems: RawNormalizedText[] = [];
+    for (const item of textContent.items) {
+      if ('str' in item && typeof item.str === 'string') {
+        const cleaned = item.str.trim();
+        if (!cleaned) continue;
+        extractedText.push(cleaned);
+        const tx = item.transform?.[4] ?? 0;
+        const ty = item.transform?.[5] ?? 0;
+        const [vx, vy] = viewport.convertToViewportPoint(tx, ty);
+        rawNormalizedTextItems.push({
+          text: cleaned,
+          nx: Math.max(0, Math.min(1, vx / viewport.width)),
+          ny: Math.max(0, Math.min(1, vy / viewport.height)),
+        });
+      }
+    }
+
+    const ops = await page.getOperatorList();
+    const internalSegments = parseOperatorListToSegments(ops, pdfjsLib.OPS, viewport);
+    const geom = buildPayloadGeometry(
+      internalSegments,
+      rawNormalizedTextItems,
+      clampedPage,
+      baseViewport.width,
+      baseViewport.height,
+      (bounds) => cropDataUrlFromCanvas(canvas, bounds)
+    );
+
+    return {
+      fileName,
+      pageCount: pdf.numPages,
+      selectedPage: clampedPage,
+      pageWidthPt: baseViewport.width,
+      pageHeightPt: baseViewport.height,
+      renderedImageDataUrl,
+      extractedText,
+      vectorEntityCount: geom.centeredEntities.length,
+      vectorEntities: geom.centeredEntities,
+      vectorBoundingBox: geom.vectorBoundingBox,
+      hasMultipleViews: geom.viewChunks.length > 1,
+      viewChunks: geom.viewChunks,
+      rawNormalizedSegments: geom.rawNormalizedSegments,
+      rawNormalizedTextItems: rawNormalizedTextItems.slice(0, 600),
+      detectedScaleLabel: geom.detectedScaleLabel,
+      detectedScaleFactor: geom.detectedScaleFactor,
+      titleBlockMeta: geom.titleBlockMeta,
+      truncated: geom.truncated,
+      droppedSegmentCount: geom.droppedSegmentCount,
+    };
+  } finally {
+    page.cleanup();
   }
-
-  const ops = await page.getOperatorList();
-  const internalSegments = parseOperatorListToSegments(ops, pdfjsLib.OPS, viewport);
-  const geom = buildPayloadGeometry(
-    internalSegments,
-    rawNormalizedTextItems,
-    clampedPage,
-    baseViewport.width,
-    baseViewport.height,
-    (bounds) => cropDataUrlFromCanvas(canvas, bounds)
-  );
-
-  return {
-    fileName,
-    pageCount: pdf.numPages,
-    selectedPage: clampedPage,
-    pageWidthPt: baseViewport.width,
-    pageHeightPt: baseViewport.height,
-    renderedImageDataUrl,
-    extractedText,
-    vectorEntityCount: geom.centeredEntities.length,
-    vectorEntities: geom.centeredEntities,
-    vectorBoundingBox: geom.vectorBoundingBox,
-    hasMultipleViews: geom.viewChunks.length > 1,
-    viewChunks: geom.viewChunks,
-    rawNormalizedSegments: geom.rawNormalizedSegments,
-    rawNormalizedTextItems: rawNormalizedTextItems.slice(0, 600),
-    detectedScaleLabel: geom.detectedScaleLabel,
-    detectedScaleFactor: geom.detectedScaleFactor,
-    titleBlockMeta: geom.titleBlockMeta,
-    truncated: geom.truncated,
-    droppedSegmentCount: geom.droppedSegmentCount,
-  };
 }
 
 export async function repartitionPdfChunks(
