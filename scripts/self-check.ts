@@ -14,12 +14,13 @@ import {
 import {
   buildPayloadGeometry,
   buildRawVectorAnalysis,
+  detectViewRegions,
   MAX_CHUNK_VECTOR_SEGMENTS,
   MAX_TOTAL_VECTOR_SEGMENTS,
   parseOperatorListToSegments,
 } from '../src/utils/pdfVectorCore';
 import { sanitizeAnalysisResult } from '../src/utils/sanitizeAnalysis';
-import type { PdfExtractionPayload, RawNormalizedText } from '../src/types/cad';
+import type { PdfExtractionPayload, RawNormalizedSegment, RawNormalizedText } from '../src/types/cad';
 
 async function loadShellPdfPayload(): Promise<PdfExtractionPayload> {
   const pdfPath = path.resolve(process.cwd(), 'public/assets/aistudio/Shell_b55006b8.pdf');
@@ -174,8 +175,8 @@ async function main() {
       [OPS.stroke, [new Float32Array([0, 150, 305, 1, 150, 368])]],
       [OPS.stroke, [new Float32Array([0, 350, 305, 1, 350, 368])]],
       [OPS.stroke, [new Float32Array([0, 150, 360, 1, 350, 360])]],
-      [OPS.fill, [new Float32Array([0, 150, 360, 1, 160, 362, 1, 160, 358, 4])]],
-      [OPS.fill, [new Float32Array([0, 350, 360, 1, 340, 362, 1, 340, 358, 4])]],
+      [OPS.fillStroke, [new Float32Array([0, 150, 360, 1, 160, 362, 1, 160, 358, 4])]],
+      [OPS.fillStroke, [new Float32Array([0, 350, 360, 1, 340, 362, 1, 340, 358, 4])]],
     ],
   };
   const synSegs = parseOperatorListToSegments(mockOps, OPS, mockViewport);
@@ -276,6 +277,162 @@ async function main() {
   const longPartSpanMm = borderGeom.vectorBoundingBox.maxX - borderGeom.vectorBoundingBox.minX;
   assert.ok(longPartSpanMm > 220, `Expected >70% sheet width edge (~225.8 mm), got ${longPartSpanMm.toFixed(1)}`);
 
+  // 2e. Step 3 hand-built operator list with mocked OPS table (clip, fill-only, XObject matrix, setGState & setDash)
+  const mockedOpsTable = {
+    save: 10,
+    restore: 11,
+    transform: 12,
+    setLineWidth: 2,
+    setStrokeRGBColor: 58,
+    setStrokeGray: 56,
+    setDash: 6,
+    setGState: 9,
+    paintFormXObjectBegin: 74,
+    paintFormXObjectEnd: 75,
+    constructPath: 91,
+    moveTo: 13,
+    lineTo: 14,
+    curveTo: 15,
+    curveTo2: 16,
+    curveTo3: 17,
+    closePath: 18,
+    rectangle: 19,
+    stroke: 20,
+    closeStroke: 21,
+    fill: 22,
+    eoFill: 23,
+    fillStroke: 24,
+    eoFillStroke: 25,
+    closeFillStroke: 26,
+    closeEOFillStroke: 27,
+    endPath: 28,
+    clip: 29,
+    eoClip: 30,
+  };
+  const step3Ops = {
+    fnArray: [
+      mockedOpsTable.constructPath, // Clip-only rect (endPath / W n) -> MUST be ignored
+      mockedOpsTable.moveTo,
+      mockedOpsTable.lineTo,
+      mockedOpsTable.clip,
+      mockedOpsTable.endPath, // Legacy clip + endPath -> MUST be ignored
+      mockedOpsTable.constructPath, // Fill-only small arrowhead triangle -> MUST emit nothing
+      mockedOpsTable.constructPath, // Fill-only large block -> MUST emit nothing
+      mockedOpsTable.paintFormXObjectBegin, // Push transform [2,0,0,2,100,50]
+      mockedOpsTable.setGState, // Apply LW=0.25 and D=[[6,3,2,3],0]
+      mockedOpsTable.constructPath, // Stroked line (0,0)->(50,0) => transformed to (100,50)->(200,50), dashed, lw=0.5
+      mockedOpsTable.paintFormXObjectEnd, // Pop XObject transform & gState
+      mockedOpsTable.setDash, // Explicit setDash [4,2]
+      mockedOpsTable.constructPath, // Stroked line (10,10)->(60,10) => untransformed, dashed
+    ],
+    argsArray: [
+      [mockedOpsTable.endPath, [new Float32Array([0, 50, 50, 1, 200, 50, 1, 200, 200, 1, 50, 200, 4])]],
+      [10, 10],
+      [90, 90],
+      [],
+      [],
+      [mockedOpsTable.fill, [new Float32Array([0, 100, 100, 1, 110, 102, 1, 110, 98, 4])]],
+      [mockedOpsTable.eoFill, [new Float32Array([0, 300, 300, 1, 400, 300, 1, 400, 350, 1, 300, 350, 4])]],
+      [[2, 0, 0, 2, 100, 50], null],
+      [[['LW', 0.25], ['D', [[6, 3, 2, 3], 0]]]],
+      [mockedOpsTable.stroke, [new Float32Array([0, 0, 0, 1, 50, 0])]],
+      [],
+      [[4, 2], 0],
+      [mockedOpsTable.fillStroke, [new Float32Array([0, 10, 10, 1, 60, 10])]],
+    ],
+  };
+  const step3Segs = parseOperatorListToSegments(step3Ops, mockedOpsTable, mockViewport);
+  assert.equal(step3Segs.length, 2, `Expected exactly 2 stroked segments (clip & fill-only ignored), got ${step3Segs.length}`);
+  assert.ok(
+    Math.abs(step3Segs[0].x1Mm - 100 * (25.4 / 72)) < 0.05 &&
+      Math.abs(step3Segs[0].x2Mm - 200 * (25.4 / 72)) < 0.05,
+    'Expected XObject transform matrix applied to first stroked segment'
+  );
+  assert.equal(step3Segs[0].isDashed, true, 'Expected setGState dash pattern applied');
+  assert.ok(Math.abs(step3Segs[0].effLineWidth - 0.5) < 0.01, 'Expected setGState LW * XObject scale = 0.5');
+  assert.ok(
+    Math.abs(step3Segs[1].x1Mm - 10 * (25.4 / 72)) < 0.05 &&
+      Math.abs(step3Segs[1].x2Mm - 60 * (25.4 / 72)) < 0.05,
+    'Expected paintFormXObjectEnd restored outer transform matrix'
+  );
+  assert.equal(step3Segs[1].isDashed, true, 'Expected setDash applied to second stroked segment');
+
+  // 2f. Step 4 view clustering: 50k random segments < 300 ms & 3 well-separated views (+ >6 cluster area selection)
+  let rng = 0x13579bdf;
+  const nextRand = () => {
+    rng = (rng * 1664525 + 1013904223) >>> 0;
+    return rng / 4294967296;
+  };
+  const randSegs50k: RawNormalizedSegment[] = new Array(50000);
+  for (let i = 0; i < 50000; i++) {
+    const x1 = 0.04 + nextRand() * 0.88;
+    const y1 = 0.04 + nextRand() * 0.72;
+    const dx = (nextRand() - 0.5) * 0.04;
+    const dy = (nextRand() - 0.5) * 0.04;
+    const x2 = Math.max(0.02, Math.min(0.96, x1 + dx));
+    const y2 = Math.max(0.02, Math.min(0.78, y1 + dy));
+    randSegs50k[i] = {
+      nx1: x1,
+      ny1: y1,
+      nx2: x2,
+      ny2: y2,
+      x1Mm: x1 * 420,
+      y1Mm: (1 - y1) * 297,
+      x2Mm: x2 * 420,
+      y2Mm: (1 - y2) * 297,
+      layerHint: 'outline',
+    };
+  }
+  const t0 = performance.now();
+  const randViews = detectViewRegions(randSegs50k, [], 0.86);
+  const clusterMs = performance.now() - t0;
+  assert.ok(randViews.length >= 1 && randViews.length <= 6);
+  assert.ok(clusterMs < 300, `Expected 50k segment clustering < 300 ms, took ${clusterMs.toFixed(1)} ms`);
+
+  // Synthetic non-square sheet (500 x 200 mm): 3 large views out-of-order + 4 tiny top notes (>6 clusters total)
+  const makeBoxSegs = (
+    x1: number,
+    y1: number,
+    x2: number,
+    y2: number,
+    wMm: number,
+    hMm: number
+  ): RawNormalizedSegment[] => [
+    { nx1: x1, ny1: y1, nx2: x2, ny2: y1, x1Mm: x1 * wMm, y1Mm: (1 - y1) * hMm, x2Mm: x2 * wMm, y2Mm: (1 - y1) * hMm, layerHint: 'outline' },
+    { nx1: x2, ny1: y1, nx2: x2, ny2: y2, x1Mm: x2 * wMm, y1Mm: (1 - y1) * hMm, x2Mm: x2 * wMm, y2Mm: (1 - y2) * hMm, layerHint: 'outline' },
+    { nx1: x2, ny1: y2, nx2: x1, ny2: y2, x1Mm: x2 * wMm, y1Mm: (1 - y2) * hMm, x2Mm: x1 * wMm, y2Mm: (1 - y2) * hMm, layerHint: 'outline' },
+    { nx1: x1, ny1: y2, nx2: x1, ny2: y1, x1Mm: x1 * wMm, y1Mm: (1 - y2) * hMm, x2Mm: x1 * wMm, y2Mm: (1 - y1) * hMm, layerHint: 'outline' },
+  ];
+  // Top-right view [0.55..0.85, 0.12..0.38], Top-left view [0.10..0.40, 0.12..0.38], Bottom view [0.15..0.75, 0.55..0.78]
+  // Notice gap between Top-left and Top-right is 0.15 (75 mm > 8 mm). Add 5 tiny noise boxes at top strip.
+  const multiViewSegs: RawNormalizedSegment[] = [
+    ...makeBoxSegs(0.15, 0.55, 0.75, 0.78, 500, 200), // Bottom large view inserted first
+    ...makeBoxSegs(0.55, 0.12, 0.85, 0.38, 500, 200), // Top-right view inserted second
+    ...makeBoxSegs(0.10, 0.12, 0.40, 0.38, 500, 200), // Top-left view inserted third
+    // 5 tiny (> 0.04 span, smaller area than main views) noise/callout boxes near top strip
+    ...makeBoxSegs(0.05, 0.03, 0.095, 0.06, 500, 200),
+    ...makeBoxSegs(0.20, 0.03, 0.245, 0.06, 500, 200),
+    ...makeBoxSegs(0.38, 0.03, 0.425, 0.06, 500, 200),
+    ...makeBoxSegs(0.60, 0.03, 0.645, 0.06, 500, 200),
+    ...makeBoxSegs(0.80, 0.03, 0.845, 0.06, 500, 200),
+  ];
+  const multiViews = detectViewRegions(multiViewSegs, [], 0.88);
+  assert.equal(multiViews.length, 6, 'Expected top 6 views by area when 8 clusters exist');
+  // The 3 largest views must ALL be kept and appear after/in reading order (two top views left->right, then bottom view last)
+  const largeViews = multiViews.filter((v) => v.normBounds.w >= 0.3);
+  assert.equal(largeViews.length, 3, 'Expected all 3 large views preserved despite 5 smaller top clusters');
+  assert.ok(largeViews[0].normBounds.x < largeViews[1].normBounds.x, 'Expected top band left-to-right reading order');
+  assert.ok(largeViews[2].normBounds.y > largeViews[0].normBounds.y + 0.2, 'Expected bottom view sorted after top band');
+
+  // Pure 3-view check + isotropic 8 mm check: two views separated horizontally by 11 mm on 500 mm wide sheet (dx=0.022 < old 0.026, > 8/500=0.016) must stay separate!
+  const isoSegs: RawNormalizedSegment[] = [
+    ...makeBoxSegs(0.10, 0.15, 0.30, 0.35, 500, 200),
+    ...makeBoxSegs(0.322, 0.15, 0.52, 0.35, 500, 200), // 11 mm gap in X from view 1
+    ...makeBoxSegs(0.10, 0.52, 0.52, 0.72, 500, 200),
+  ];
+  const isoViews = detectViewRegions(isoSegs, [], 0.88);
+  assert.equal(isoViews.length, 3, `Expected 3 separate views with 11 mm X gap on 500 mm wide sheet, got ${isoViews.length}`);
+
   // 3. Entity & NaN sanitization guards
   const sanitized = sanitizeAnalysisResult({
     partName: 'Guard Test',
@@ -290,7 +447,7 @@ async function main() {
   assert.ok(Number.isFinite(sanitized.boundingBox.minX) && Number.isFinite(sanitized.boundingBox.maxX));
 
   console.log(
-    `Self-check passed: Shell_b55006b8.pdf (${payload.vectorEntityCount} vectors, ${payload.viewChunks.length} views, real ${realSpanX.toFixed(1)}x${realSpanY.toFixed(1)} mm), Step 1-2 compaction & border filter, dim topology, CAM & sanitize guards OK.`
+    `Self-check passed: Shell_b55006b8.pdf (${payload.vectorEntityCount} vectors, ${payload.viewChunks.length} views, real ${realSpanX.toFixed(1)}x${realSpanY.toFixed(1)} mm), Step 1-4 (50k grid cluster ${clusterMs.toFixed(1)} ms), paint/clip/XObject, dim topology, CAM & sanitize guards OK.`
   );
 }
 

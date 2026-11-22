@@ -55,6 +55,9 @@ export interface PdfOpsTable {
   setStrokeRGBColor: number;
   setStrokeGray: number;
   setDash: number;
+  setGState?: number;
+  paintFormXObjectBegin?: number;
+  paintFormXObjectEnd?: number;
   constructPath: number;
   moveTo: number;
   lineTo: number;
@@ -63,10 +66,17 @@ export interface PdfOpsTable {
   curveTo3: number;
   closePath: number;
   rectangle: number;
+  stroke?: number;
+  closeStroke?: number;
   fill?: number;
   eoFill?: number;
   fillStroke?: number;
   eoFillStroke?: number;
+  closeFillStroke?: number;
+  closeEOFillStroke?: number;
+  endPath?: number;
+  clip?: number;
+  eoClip?: number;
 }
 
 export interface PdfViewportLike {
@@ -650,6 +660,32 @@ export function parseOperatorListToSegments(
     }
   };
 
+  const isFilledPaintOp = (paintOp: number): boolean =>
+    paintOp !== -1 &&
+    ((typeof OPS.fill === 'number' && paintOp === OPS.fill) ||
+      (typeof OPS.eoFill === 'number' && paintOp === OPS.eoFill) ||
+      (typeof OPS.fillStroke === 'number' && paintOp === OPS.fillStroke) ||
+      (typeof OPS.eoFillStroke === 'number' && paintOp === OPS.eoFillStroke) ||
+      (typeof OPS.closeFillStroke === 'number' && paintOp === OPS.closeFillStroke) ||
+      (typeof OPS.closeEOFillStroke === 'number' && paintOp === OPS.closeEOFillStroke));
+
+  const isStrokedPaintOp = (paintOp: number): boolean =>
+    paintOp !== -1 &&
+    ((typeof OPS.stroke === 'number' && paintOp === OPS.stroke) ||
+      (typeof OPS.closeStroke === 'number' && paintOp === OPS.closeStroke) ||
+      (typeof OPS.fillStroke === 'number' && paintOp === OPS.fillStroke) ||
+      (typeof OPS.eoFillStroke === 'number' && paintOp === OPS.eoFillStroke) ||
+      (typeof OPS.closeFillStroke === 'number' && paintOp === OPS.closeFillStroke) ||
+      (typeof OPS.closeEOFillStroke === 'number' && paintOp === OPS.closeEOFillStroke));
+
+  const isDiscardPaintOp = (op: number): boolean =>
+    (typeof OPS.fill === 'number' && op === OPS.fill) ||
+    (typeof OPS.eoFill === 'number' && op === OPS.eoFill) ||
+    (typeof OPS.endPath === 'number' && op === OPS.endPath);
+
+  let pendingLegacySubpaths: InternalSegment[][] = [];
+  let curLegacySegs: InternalSegment[] = [];
+
   for (let i = 0; i < ops.fnArray.length; i++) {
     const fn = ops.fnArray[i];
     const args = ops.argsArray[i] || [];
@@ -657,6 +693,15 @@ export function parseOperatorListToSegments(
     if (fn === OPS.save) {
       gStack.push(cloneState(gState));
     } else if (fn === OPS.restore) {
+      if (gStack.length > 1) {
+        gState = gStack.pop()!;
+      }
+    } else if (typeof OPS.paintFormXObjectBegin === 'number' && fn === OPS.paintFormXObjectBegin) {
+      gStack.push(cloneState(gState));
+      if (Array.isArray(args[0]) && args[0].length >= 6) {
+        gState.cm = multiplyMatrix(gState.cm, args[0] as Matrix);
+      }
+    } else if (typeof OPS.paintFormXObjectEnd === 'number' && fn === OPS.paintFormXObjectEnd) {
       if (gStack.length > 1) {
         gState = gStack.pop()!;
       }
@@ -672,16 +717,19 @@ export function parseOperatorListToSegments(
     } else if (fn === OPS.setDash) {
       const arr = Array.isArray(args[0]) ? (args[0] as number[]) : [];
       gState.dashPattern = arr.filter((n) => typeof n === 'number' && n > 0);
+    } else if (typeof OPS.setGState === 'number' && fn === OPS.setGState && Array.isArray(args[0])) {
+      for (const entry of args[0]) {
+        if (!Array.isArray(entry) || entry.length < 2) continue;
+        const [key, val] = entry;
+        if (key === 'LW' && typeof val === 'number' && Number.isFinite(val)) {
+          gState.lineWidth = val;
+        } else if (key === 'D' && Array.isArray(val) && Array.isArray(val[0])) {
+          gState.dashPattern = (val[0] as unknown[]).filter(
+            (n): n is number => typeof n === 'number' && n > 0
+          );
+        }
+      }
     } else if (fn === OPS.constructPath) {
-      let pathSegs: InternalSegment[] = [];
-      const paintOp = typeof args[0] === 'number' ? args[0] : -1;
-      const isFilled =
-        paintOp !== -1 &&
-        (paintOp === OPS.fill ||
-          paintOp === OPS.eoFill ||
-          paintOp === OPS.fillStroke ||
-          paintOp === OPS.eoFillStroke);
-
       // pdfjs-dist v5+ packed DrawOPS format: args[0] = paintOp, args[1] = [Float32Array]
       if (
         typeof args[0] === 'number' &&
@@ -689,6 +737,12 @@ export function parseOperatorListToSegments(
         args[1][0] &&
         typeof (args[1][0] as { length?: number }).length === 'number'
       ) {
+        const paintOp = args[0];
+        if (!isStrokedPaintOp(paintOp)) {
+          continue; // Ignore clip-only (W n / endPath) and fill-only paths (including fill-only arrowheads)
+        }
+        const isFilled = isFilledPaintOp(paintOp);
+        let pathSegs: InternalSegment[] = [];
         const arr = args[1][0] as Float32Array | number[];
         let k = 0;
         while (k < arr.length) {
@@ -728,19 +782,20 @@ export function parseOperatorListToSegments(
             break;
           }
         }
+        commitPathSegments(pathSegs, isFilled);
       } else if (Array.isArray(args[0]) && Array.isArray(args[1])) {
+        // Legacy constructPath(subOps, coords) waits for trailing paint op (stroke / fill / endPath)
         const subOps = args[0] as number[];
         const coords = args[1] as number[];
         const idxRef = { idx: 0 };
         for (const subOp of subOps) {
-          if (subOp === OPS.moveTo && pathSegs.length > 0) {
-            commitPathSegments(pathSegs, isFilled);
-            pathSegs = [];
+          if (subOp === OPS.moveTo && curLegacySegs.length > 0) {
+            pendingLegacySubpaths.push(curLegacySegs);
+            curLegacySegs = [];
           }
-          handleLegacySubOp(subOp, coords, idxRef, pathSegs);
+          handleLegacySubOp(subOp, coords, idxRef, curLegacySegs);
         }
       }
-      commitPathSegments(pathSegs, isFilled);
     } else if (
       fn === OPS.moveTo ||
       fn === OPS.lineTo ||
@@ -750,9 +805,28 @@ export function parseOperatorListToSegments(
       fn === OPS.closePath ||
       fn === OPS.rectangle
     ) {
-      const pathSegs: InternalSegment[] = [];
-      handleLegacySubOp(fn, args as number[], { idx: 0 }, pathSegs);
-      commitPathSegments(pathSegs);
+      if ((fn === OPS.moveTo || fn === OPS.rectangle) && curLegacySegs.length > 0) {
+        pendingLegacySubpaths.push(curLegacySegs);
+        curLegacySegs = [];
+      }
+      handleLegacySubOp(fn, args as number[], { idx: 0 }, curLegacySegs);
+      if (fn === OPS.rectangle && curLegacySegs.length > 0) {
+        pendingLegacySubpaths.push(curLegacySegs);
+        curLegacySegs = [];
+      }
+    } else if (isStrokedPaintOp(fn)) {
+      if (curLegacySegs.length > 0) {
+        pendingLegacySubpaths.push(curLegacySegs);
+        curLegacySegs = [];
+      }
+      const filled = isFilledPaintOp(fn);
+      for (const sub of pendingLegacySubpaths) {
+        commitPathSegments(sub, filled);
+      }
+      pendingLegacySubpaths = [];
+    } else if (isDiscardPaintOp(fn)) {
+      pendingLegacySubpaths = [];
+      curLegacySegs = [];
     }
   }
 
@@ -1302,7 +1376,8 @@ export function buildPayloadGeometry(
   const detectedSpecs = detectViewRegions(
     retainedSegs,
     rawNormalizedTextItems,
-    titleBlockTopNy
+    titleBlockTopNy,
+    { width: pageWidthPt * PT_TO_MM, height: pageHeightPt * PT_TO_MM }
   );
   const chunkBuild = buildViewChunksWithStats(
     detectedSpecs,
@@ -1570,19 +1645,42 @@ function classifyViewFromFeatures(
   };
 }
 
-function boxesOverlapOrNear(a: NormalizedRect, b: NormalizedRect, gap: number): boolean {
-  return !(
-    a.x + a.w + gap < b.x ||
-    b.x + b.w + gap < a.x ||
-    a.y + a.h + gap < b.y ||
-    b.y + b.h + gap < a.y
-  );
+const VIEW_MERGE_GAP_MM = 8;
+const MAX_VIEW_GRID_DIM = 192;
+
+function inferSheetSizeMm(segments: RawNormalizedSegment[]): { width: number; height: number } {
+  let sumDxMm = 0;
+  let sumDnx = 0;
+  let sumDyMm = 0;
+  let sumDny = 0;
+  for (let i = 0; i < segments.length; i++) {
+    const s = segments[i];
+    const dnx = Math.abs(s.nx2 - s.nx1);
+    const dny = Math.abs(s.ny2 - s.ny1);
+    const dxMm = Math.abs(s.x2Mm - s.x1Mm);
+    const dyMm = Math.abs(s.y2Mm - s.y1Mm);
+    if (dnx >= 1e-4 && dxMm > 0) {
+      sumDnx += dnx;
+      sumDxMm += dxMm;
+    }
+    if (dny >= 1e-4 && dyMm > 0) {
+      sumDny += dny;
+      sumDyMm += dyMm;
+    }
+  }
+  const rawW = sumDnx > 0 ? sumDxMm / sumDnx : 297;
+  const rawH = sumDny > 0 ? sumDyMm / sumDny : 210;
+  return {
+    width: Math.max(40, Math.min(4000, rawW)),
+    height: Math.max(40, Math.min(4000, rawH)),
+  };
 }
 
 export function detectViewRegions(
   segments: RawNormalizedSegment[],
   textItems: RawNormalizedText[],
-  titleBlockTopNy: number
+  titleBlockTopNy: number,
+  sheetSizeMm: { width: number; height: number } | undefined = undefined
 ): Array<{ normBounds: NormalizedRect; viewKind: ViewChunkKind; label: string }> {
   const structuralIndices: number[] = [];
   for (let i = 0; i < segments.length; i++) {
@@ -1591,10 +1689,10 @@ export function detectViewRegions(
     }
   }
 
-  const indicesToCluster =
-    structuralIndices.length >= 6 ? structuralIndices : segments.map((_, idx) => idx);
+  const useStructural = structuralIndices.length >= 6;
+  const n = useStructural ? structuralIndices.length : segments.length;
 
-  if (indicesToCluster.length === 0) {
+  if (n === 0) {
     return [
       {
         normBounds: { x: 0.05, y: 0.06, w: 0.9, h: Math.max(0.4, titleBlockTopNy - 0.08) },
@@ -1604,84 +1702,200 @@ export function detectViewRegions(
     ];
   }
 
-  interface Cluster {
+  const resolvedSize = sheetSizeMm ?? inferSheetSizeMm(segments);
+  const gapX = Math.max(0.004, Math.min(0.15, VIEW_MERGE_GAP_MM / Math.max(1, resolvedSize.width)));
+  const gapY = Math.max(0.004, Math.min(0.15, VIEW_MERGE_GAP_MM / Math.max(1, resolvedSize.height)));
+
+  const cellW = Math.max(gapX, 1 / MAX_VIEW_GRID_DIM);
+  const cellH = Math.max(gapY, 1 / MAX_VIEW_GRID_DIM);
+  const cols = Math.min(MAX_VIEW_GRID_DIM, Math.max(1, Math.ceil(1 / cellW)));
+  const rows = Math.min(MAX_VIEW_GRID_DIM, Math.max(1, Math.ceil(1 / cellH)));
+  const gridSize = cols * rows;
+
+  const parent = new Int32Array(n);
+  const size = new Int32Array(n);
+  const minX = new Float32Array(n);
+  const minY = new Float32Array(n);
+  const maxX = new Float32Array(n);
+  const maxY = new Float32Array(n);
+  const lenSum = new Float32Array(n);
+
+  for (let i = 0; i < n; i++) {
+    const s = segments[useStructural ? structuralIndices[i] : i];
+    parent[i] = i;
+    size[i] = 1;
+    minX[i] = s.nx1 < s.nx2 ? s.nx1 : s.nx2;
+    minY[i] = s.ny1 < s.ny2 ? s.ny1 : s.ny2;
+    maxX[i] = s.nx1 > s.nx2 ? s.nx1 : s.nx2;
+    maxY[i] = s.ny1 > s.ny2 ? s.ny1 : s.ny2;
+    lenSum[i] = Math.hypot(s.x2Mm - s.x1Mm, s.y2Mm - s.y1Mm);
+  }
+
+  const find = (x: number): number => {
+    let cur = x;
+    while (parent[cur] !== cur) {
+      parent[cur] = parent[parent[cur]];
+      cur = parent[cur];
+    }
+    return cur;
+  };
+
+  const union = (a: number, b: number): number => {
+    let ra = find(a);
+    let rb = find(b);
+    if (ra === rb) return ra;
+    if (size[ra] < size[rb]) {
+      const tmp = ra;
+      ra = rb;
+      rb = tmp;
+    }
+    parent[rb] = ra;
+    size[ra] += size[rb];
+    if (minX[rb] < minX[ra]) minX[ra] = minX[rb];
+    if (minY[rb] < minY[ra]) minY[ra] = minY[rb];
+    if (maxX[rb] > maxX[ra]) maxX[ra] = maxX[rb];
+    if (maxY[rb] > maxY[ra]) maxY[ra] = maxY[rb];
+    lenSum[ra] += lenSum[rb];
+    return ra;
+  };
+
+  const cellRep = new Int32Array(gridSize).fill(-1);
+  const cellMinX = new Float32Array(gridSize).fill(Infinity);
+  const cellMinY = new Float32Array(gridSize).fill(Infinity);
+  const cellMaxX = new Float32Array(gridSize).fill(-Infinity);
+  const cellMaxY = new Float32Array(gridSize).fill(-Infinity);
+
+  // Uniform grid pass: segments sharing a (gapX x gapY) cell are within (gapX, gapY)
+  for (let i = 0; i < n; i++) {
+    const sx1 = minX[i];
+    const sy1 = minY[i];
+    const sx2 = maxX[i];
+    const sy2 = maxY[i];
+    const c1 = Math.min(cols - 1, Math.max(0, Math.floor(sx1 / cellW)));
+    const c2 = Math.min(cols - 1, Math.max(0, Math.floor(sx2 / cellW)));
+    const r1 = Math.min(rows - 1, Math.max(0, Math.floor(sy1 / cellH)));
+    const r2 = Math.min(rows - 1, Math.max(0, Math.floor(sy2 / cellH)));
+
+    for (let r = r1; r <= r2; r++) {
+      const rowBase = r * cols;
+      const cellY0 = r * cellH;
+      const cellY1 = cellY0 + cellH;
+      const cy1 = sy1 > cellY0 ? sy1 : cellY0;
+      const cy2 = sy2 < cellY1 ? sy2 : cellY1;
+      for (let c = c1; c <= c2; c++) {
+        const cellIdx = rowBase + c;
+        const cellX0 = c * cellW;
+        const cellX1 = cellX0 + cellW;
+        const cx1 = sx1 > cellX0 ? sx1 : cellX0;
+        const cx2 = sx2 < cellX1 ? sx2 : cellX1;
+        if (cx1 < cellMinX[cellIdx]) cellMinX[cellIdx] = cx1;
+        if (cx2 > cellMaxX[cellIdx]) cellMaxX[cellIdx] = cx2;
+        if (cy1 < cellMinY[cellIdx]) cellMinY[cellIdx] = cy1;
+        if (cy2 > cellMaxY[cellIdx]) cellMaxY[cellIdx] = cy2;
+        const rep = cellRep[cellIdx];
+        if (rep === -1) {
+          cellRep[cellIdx] = i;
+        } else {
+          union(i, rep);
+        }
+      }
+    }
+  }
+
+  // Forward-neighbor pass catches pairs within (gapX, gapY) across cell boundaries without quantization overshoot
+  const neighborOffsets: Array<[number, number]> = [
+    [1, 0],
+    [0, 1],
+    [1, 1],
+    [-1, 1],
+  ];
+  for (let r = 0; r < rows; r++) {
+    for (let c = 0; c < cols; c++) {
+      const idxA = r * cols + c;
+      const repA = cellRep[idxA];
+      if (repA === -1) continue;
+      const ax1 = cellMinX[idxA];
+      const ay1 = cellMinY[idxA];
+      const ax2 = cellMaxX[idxA];
+      const ay2 = cellMaxY[idxA];
+      for (let k = 0; k < 4; k++) {
+        const nc = c + neighborOffsets[k][0];
+        const nr = r + neighborOffsets[k][1];
+        if (nc < 0 || nc >= cols || nr >= rows) continue;
+        const idxB = nr * cols + nc;
+        const repB = cellRep[idxB];
+        if (repB === -1 || find(repA) === find(repB)) continue;
+        const bx1 = cellMinX[idxB];
+        const by1 = cellMinY[idxB];
+        const bx2 = cellMaxX[idxB];
+        const by2 = cellMaxY[idxB];
+        if (!(ax2 + gapX < bx1 || bx2 + gapX < ax1 || ay2 + gapY < by1 || by2 + gapY < ay1)) {
+          union(repA, repB);
+        }
+      }
+    }
+  }
+
+  // Sweep-and-prune pass merges isolated interior features (e.g. concentric holes) enclosed in outer view bboxes
+  const rawRoots: number[] = [];
+  for (let i = 0; i < n; i++) {
+    if (parent[i] === i) rawRoots.push(i);
+  }
+  let sweepMerged = true;
+  let activeRoots = rawRoots;
+  while (sweepMerged && activeRoots.length > 1) {
+    sweepMerged = false;
+    activeRoots.sort((a, b) => minX[a] - minX[b]);
+    const nextRoots: number[] = [];
+    for (let idx = 0; idx < activeRoots.length; idx++) {
+      let cur = find(activeRoots[idx]);
+      if (cur !== activeRoots[idx]) continue;
+      for (let j = idx + 1; j < activeRoots.length; j++) {
+        const other = find(activeRoots[j]);
+        if (other === cur) continue;
+        if (minX[other] > maxX[cur] + gapX) break;
+        if (!(maxY[cur] + gapY < minY[other] || maxY[other] + gapY < minY[cur])) {
+          cur = union(cur, other);
+          sweepMerged = true;
+        }
+      }
+      nextRoots.push(cur);
+    }
+    activeRoots = nextRoots;
+  }
+
+  interface ClusterSummary {
+    root: number;
     x1: number;
     y1: number;
     x2: number;
     y2: number;
     count: number;
-    segIndices: number[];
+    lenSum: number;
   }
 
-  let clusters: Cluster[] = indicesToCluster.map((idx) => {
-    const s = segments[idx];
-    return {
-      x1: Math.min(s.nx1, s.nx2),
-      y1: Math.min(s.ny1, s.ny2),
-      x2: Math.max(s.nx1, s.nx2),
-      y2: Math.max(s.ny1, s.ny2),
-      count: 1,
-      segIndices: [idx],
-    };
-  });
-
-  // shortcut: fixed 2.6% normalized gap merges view primitives without bridging neighboring views; upgrade to adaptive gap for dense detail sheets
-  const gap = 0.026;
-  let merged = true;
-  while (merged && clusters.length > 1) {
-    merged = false;
-    const next: Cluster[] = [];
-    const used = new Array<boolean>(clusters.length).fill(false);
-
-    for (let i = 0; i < clusters.length; i++) {
-      if (used[i]) continue;
-      let cur = clusters[i];
-      used[i] = true;
-
-      let changed = true;
-      while (changed) {
-        changed = false;
-        for (let j = 0; j < clusters.length; j++) {
-          if (used[j]) continue;
-          const other = clusters[j];
-          const curRect: NormalizedRect = {
-            x: cur.x1,
-            y: cur.y1,
-            w: cur.x2 - cur.x1,
-            h: cur.y2 - cur.y1,
-          };
-          const otherRect: NormalizedRect = {
-            x: other.x1,
-            y: other.y1,
-            w: other.x2 - other.x1,
-            h: other.y2 - other.y1,
-          };
-          if (boxesOverlapOrNear(curRect, otherRect, gap)) {
-            cur = {
-              x1: Math.min(cur.x1, other.x1),
-              y1: Math.min(cur.y1, other.y1),
-              x2: Math.max(cur.x2, other.x2),
-              y2: Math.max(cur.y2, other.y2),
-              count: cur.count + other.count,
-              segIndices: cur.segIndices.concat(other.segIndices),
-            };
-            used[j] = true;
-            changed = true;
-            merged = true;
-          }
-        }
-      }
-      next.push(cur);
+  const significantAll: ClusterSummary[] = [];
+  for (const r of activeRoots) {
+    const root = find(r);
+    if (root !== r) continue;
+    const x1 = minX[root];
+    const y1 = minY[root];
+    const x2 = maxX[root];
+    const y2 = maxY[root];
+    if (size[root] >= 3 && (x2 - x1 >= 0.04 || y2 - y1 >= 0.04)) {
+      significantAll.push({
+        root,
+        x1,
+        y1,
+        x2,
+        y2,
+        count: size[root],
+        lenSum: lenSum[root],
+      });
     }
-    clusters = next;
   }
 
-  const significant = clusters
-    .filter((c) => c.count >= 3 && (c.x2 - c.x1 >= 0.04 || c.y2 - c.y1 >= 0.04))
-    .sort((a, b) => (Math.abs(a.y1 - b.y1) > 0.14 ? a.y1 - b.y1 : a.x1 - b.x1))
-    .slice(0, 6);
-
-  if (significant.length === 0) {
+  if (significantAll.length === 0) {
     return [
       {
         normBounds: { x: 0.05, y: 0.06, w: 0.9, h: Math.max(0.4, titleBlockTopNy - 0.08) },
@@ -1689,6 +1903,29 @@ export function detectViewRegions(
         label: 'Primary Drawing View',
       },
     ];
+  }
+
+  significantAll.sort((a, b) => {
+    const areaA = (a.x2 - a.x1) * (a.y2 - a.y1);
+    const areaB = (b.x2 - b.x1) * (b.y2 - b.y1);
+    if (Math.abs(areaB - areaA) > 1e-6) return areaB - areaA;
+    return b.lenSum - a.lenSum;
+  });
+
+  const significant = significantAll
+    .slice(0, 6)
+    .sort((a, b) => (Math.abs(a.y1 - b.y1) > 0.14 ? a.y1 - b.y1 : a.x1 - b.x1));
+
+  const rootToSelected = new Map<number, number>();
+  const clusterSegBuckets: RawNormalizedSegment[][] = significant.map((c, idx) => {
+    rootToSelected.set(c.root, idx);
+    return [];
+  });
+  for (let i = 0; i < n; i++) {
+    const selIdx = rootToSelected.get(find(i));
+    if (selIdx !== undefined) {
+      clusterSegBuckets[selIdx].push(segments[useStructural ? structuralIndices[i] : i]);
+    }
   }
 
   return significant.map((c, idx) => {
@@ -1713,11 +1950,7 @@ export function detectViewRegions(
       )
       .map((t) => t.text);
 
-    const clusterSegs = c.segIndices
-      .map((i) => segments[i])
-      .filter((s): s is RawNormalizedSegment => Boolean(s));
-
-    const classified = classifyViewFromFeatures(nearbyTokens, normBounds, clusterSegs, idx);
+    const classified = classifyViewFromFeatures(nearbyTokens, normBounds, clusterSegBuckets[idx], idx);
     return {
       normBounds,
       viewKind: classified.viewKind,
